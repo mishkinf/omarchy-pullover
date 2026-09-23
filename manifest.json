@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.mishkinf.pushover",
-  "name": "Pushover",
-  "version": "1.2.0",
+  "id": "io.github.mishkinf.pullover",
+  "name": "Pullover",
+  "version": "2.0.0",
   "author": "Mishkin Faustini",
   "license": "MIT",
-  "description": "Pushover pushes as native desktop notifications, plus a bar widget with unread count and recent-message history. Uses Pushover's Open Client API, so every push that reaches the phone reaches this machine.",
+  "description": "An unofficial Pushover Open Client for Omarchy, not released or supported by Pushover. Native desktop notifications, a bar widget with unread count and history, and sign-in from the panel.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,8 +13,8 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Pushover",
-    "description": "Unread count in the bar, recent pushes in the panel, emergency acknowledgement without reaching for the phone.",
+    "displayName": "Pullover",
+    "description": "Pushover messages as native notifications, with unread count, recent history and emergency acknowledgement.",
     "category": "Notifications",
     "allowMultiple": false,
     "defaultSection": "right",

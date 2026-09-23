@@ -20,7 +20,7 @@ os.environ["XDG_CONFIG_HOME"] = f"{_SANDBOX}/config"
 os.environ["XDG_STATE_HOME"] = f"{_SANDBOX}/state"
 os.environ["XDG_CACHE_HOME"] = f"{_SANDBOX}/cache"
 
-_CLIENT = Path(__file__).resolve().parent.parent / "bin" / "pushover-open-client"
+_CLIENT = Path(__file__).resolve().parent.parent / "bin" / "pullover"
 _spec = importlib.util.spec_from_loader(
     "pushover_client",
     importlib.machinery.SourceFileLoader("pushover_client", str(_CLIENT)),
@@ -186,13 +186,32 @@ class NotifyDispatch(unittest.TestCase):
             client.notify({"title": "t", "message": "m"})
 
     def test_the_native_sender_is_preferred(self):
-        def which(name):
-            return "/usr/bin/" + name
-        with mock.patch.object(client.shutil, "which", side_effect=which), \
+        with mock.patch.object(client.shutil, "which", side_effect=lambda n: "/usr/bin/" + n), \
              mock.patch.object(client, "icon_path", return_value=None), \
-             mock.patch.object(client.subprocess, "run") as run:
-            client.notify({"title": "t", "message": "m", "priority": 0})
+             mock.patch.object(client.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)) as run:
+            self.assertTrue(client.notify({"title": "t", "message": "m", "priority": 0}))
         self.assertEqual(run.call_args[0][0][0], "omarchy-notification-send")
+
+    def test_a_failing_native_sender_falls_back_rather_than_losing_the_push(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv[0])
+            return mock.Mock(returncode=1 if argv[0] == "omarchy-notification-send" else 0)
+
+        with mock.patch.object(client.shutil, "which", side_effect=lambda n: "/usr/bin/" + n), \
+             mock.patch.object(client, "icon_path", return_value=None), \
+             mock.patch.object(client.subprocess, "run", side_effect=run):
+            self.assertTrue(client.notify({"title": "t", "message": "m", "priority": 0}))
+        self.assertEqual(calls, ["omarchy-notification-send", "notify-send"])
+
+    def test_notify_reports_failure_so_the_caller_can_say_so(self):
+        with mock.patch.object(client.shutil, "which", side_effect=lambda n: "/usr/bin/" + n), \
+             mock.patch.object(client, "icon_path", return_value=None), \
+             mock.patch.object(client.subprocess, "run",
+                               return_value=mock.Mock(returncode=1)):
+            self.assertFalse(client.notify({"title": "t", "message": "m", "priority": 0}))
 
 
 class Login(unittest.TestCase):
@@ -357,3 +376,140 @@ class Trial(unittest.TestCase):
             c._trial_checked_at = 0.0
             c.maybe_warn_about_trial()
             self.assertEqual(notify.call_count, 1)
+
+
+class OptionSafety(unittest.TestCase):
+    def test_a_title_that_is_a_flag_cannot_reach_option_position(self):
+        # The real sender exits 1 and displays nothing for a bare "--urgency".
+        self.assertEqual(client.option_safe("--urgency"), "⁠--urgency")
+        self.assertEqual(client.option_safe("--app-name=Evil"), "⁠--app-name=Evil")
+
+    def test_ordinary_text_is_untouched(self):
+        self.assertEqual(client.option_safe("Deal closed"), "Deal closed")
+
+    def test_only_http_urls_become_a_click_action(self):
+        self.assertTrue(client.url_is_openable("https://example.com"))
+        self.assertTrue(client.url_is_openable("http://example.com"))
+        for hostile in ("file:///etc/passwd", "ssh://host", "javascript:alert(1)", ""):
+            self.assertFalse(client.url_is_openable(hostile), hostile)
+
+    def test_a_non_http_url_is_dropped_from_the_argv(self):
+        argv = client.notification_argv(
+            {"title": "t", "message": "m", "priority": 0, "url": "file:///etc/passwd"},
+            None, native=True)
+        self.assertNotIn("--exec", argv)
+
+
+class MalformedPayloads(unittest.TestCase):
+    """Every one of these used to kill the daemon, which systemd restarted into
+    the same batch every five seconds, re-notifying each time."""
+
+    def setUp(self):
+        # Client.__init__ adopts the history on disk, so a status file left by
+        # an earlier test leaks into this one's assertions.
+        client.STATUS_PATH.unlink(missing_ok=True)
+
+    def _sync(self, messages):
+        c = client.Client({"secret": "s", "device_id": "d"})
+        response = mock.Mock(ok=True)
+        response.json.return_value = {"messages": messages}
+        with mock.patch.object(client, "api_get", return_value=response), \
+             mock.patch.object(client, "api_post", return_value=mock.Mock(ok=True)), \
+             mock.patch.object(client, "notify", return_value=True):
+            c.sync_messages()
+        return c
+
+    def test_a_string_id_does_not_raise(self):
+        self._sync([{"id": "abc", "title": "t", "message": "m", "date": 1}])
+
+    def test_a_batch_with_no_usable_id_does_not_raise(self):
+        self._sync([{"title": "t", "message": "m", "date": 1}])
+
+    def test_a_string_priority_does_not_raise(self):
+        self._sync([{"id": 5, "title": "t", "message": "m", "date": 1, "priority": "high"}])
+
+    def test_a_string_date_does_not_raise(self):
+        self._sync([{"id": 5, "title": "t", "message": "m", "date": "2026-01-01"}])
+
+    def test_a_failed_notification_is_recorded_rather_than_dropped(self):
+        c = client.Client({"secret": "s", "device_id": "d"})
+        response = mock.Mock(ok=True)
+        response.json.return_value = {"messages": [{"id": 5, "title": "t", "message": "m", "date": 1}]}
+        with mock.patch.object(client, "api_get", return_value=response), \
+             mock.patch.object(client, "api_post", return_value=mock.Mock(ok=True)), \
+             mock.patch.object(client, "notify", return_value=False):
+            c.sync_messages()
+        self.assertIn("could not be displayed", c.status.last_error)
+        self.assertEqual(len(c.status.messages), 1)
+
+
+class SecretRedaction(unittest.TestCase):
+    def test_the_secret_never_reaches_the_state_file(self):
+        client.register_secret("SUPERSECRET")
+        try:
+            text = client.redact(
+                "HTTPSConnectionPool: url /1/messages.json?secret=SUPERSECRET&device_id=d")
+            self.assertNotIn("SUPERSECRET", text)
+            self.assertIn("[redacted]", text)
+        finally:
+            client._REDACTIONS.clear()
+
+
+class TrialWarnings(unittest.TestCase):
+    def setUp(self):
+        client.CREDENTIALS_PATH.unlink(missing_ok=True)
+        client.TRIAL_WARNED_PATH.unlink(missing_ok=True)
+
+    def _fire(self, days_ago):
+        client.save_credentials({
+            "secret": "s", "device_id": "d", "device_name": "n",
+            "registered_at": int(time.time()) - days_ago * 86400,
+        })
+        titles = []
+        c = client.Client({"secret": "s", "device_id": "d"})
+        with mock.patch.object(client, "notify",
+                               side_effect=lambda m: titles.append(m["title"]) or True):
+            for _ in range(3):
+                c._trial_checked_at = None
+                c.maybe_warn_about_trial()
+        return titles
+
+    def test_a_late_start_announces_once_not_once_per_threshold(self):
+        self.assertEqual(len(self._fire(29)), 1)
+
+    def test_an_expired_trial_never_says_zero_days(self):
+        titles = self._fire(45)
+        self.assertEqual(len(titles), 1)
+        self.assertIn("has ended", titles[0])
+        self.assertNotIn("0 days", titles[0])
+
+    def test_the_first_hour_of_uptime_is_not_a_blind_spot(self):
+        client.save_credentials({
+            "secret": "s", "device_id": "d", "device_name": "n",
+            "registered_at": int(time.time()) - 25 * 86400,
+        })
+        c = client.Client({"secret": "s", "device_id": "d"})
+        # A machine booted 42 seconds ago.
+        with mock.patch.object(client.time, "monotonic", return_value=42.0), \
+             mock.patch.object(client, "notify", return_value=True) as notify:
+            c.maybe_warn_about_trial()
+        notify.assert_called_once()
+
+
+class CredentialRewrites(unittest.TestCase):
+    def test_a_rewrite_does_not_restart_the_trial_clock(self):
+        client.CREDENTIALS_PATH.unlink(missing_ok=True)
+        # A legacy file with no registered_at, dated 20 days ago.
+        client.save_credentials({"secret": "s", "device_id": "d", "device_name": "n"})
+        old = int(time.time()) - 20 * 86400
+        os.utime(client.CREDENTIALS_PATH, (old, old))
+
+        before = client.trial_state()["daysRemaining"]
+        with client.CREDENTIALS_PATH.open() as handle:
+            creds = json.load(handle)
+        creds.pop("registered_at", None)
+        client.save_credentials(creds)          # what `licensed --undo` does
+        after = client.trial_state()["daysRemaining"]
+
+        self.assertEqual(before, 10)
+        self.assertEqual(after, before)

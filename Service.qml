@@ -38,7 +38,7 @@ Item {
   property bool clientMissing: false
 
   readonly property string stateHome: (Quickshell.env("XDG_STATE_HOME")
-    || Quickshell.env("HOME") + "/.local/state") + "/pushover"
+    || Quickshell.env("HOME") + "/.local/state") + "/pullover"
   readonly property string statePath: stateHome + "/status.json"
   // The daemon never reads this file. Unread is a property of this screen
   // having been looked at, which only the widget can know.
@@ -85,14 +85,14 @@ Item {
   function startService() {
     if (serviceProcess.running) return
     actionStatus = "Starting…"
-    serviceProcess.command = ["pushover-open-client", "service", "enable"]
+    serviceProcess.command = ["pullover", "service", "enable"]
     serviceProcess.running = true
   }
 
   function signOut() {
     if (serviceProcess.running) return
     actionStatus = "Signing out…"
-    serviceProcess.command = ["pushover-open-client", "logout"]
+    serviceProcess.command = ["pullover", "logout"]
     serviceProcess.running = true
   }
 
@@ -120,7 +120,7 @@ Item {
   function markLicensed() {
     if (serviceProcess.running) return
     actionStatus = "Saved — the countdown stops."
-    serviceProcess.command = ["pushover-open-client", "licensed"]
+    serviceProcess.command = ["pullover", "licensed"]
     serviceProcess.running = true
   }
 
@@ -137,7 +137,7 @@ Item {
   function acknowledge(receipt) {
     if (!receipt) return
     actionStatus = "Acknowledging…"
-    ackProcess.command = ["pushover-open-client", "ack", String(receipt)]
+    ackProcess.command = ["pullover", "ack", String(receipt)]
     ackProcess.running = true
   }
 
@@ -214,7 +214,7 @@ Item {
 
   Process {
     id: probeProcess
-    command: ["pushover-open-client", "probe"]
+    command: ["pullover", "probe"]
     stdout: StdioCollector { id: probeOut; waitForEnd: true }
     onExited: function (exitCode) {
       root.probed = true
@@ -244,7 +244,7 @@ Item {
   Process {
     id: loginProcess
     property string request: ""
-    command: ["pushover-open-client", "login", "--stdin"]
+    command: ["pullover", "login", "--stdin"]
     stdinEnabled: true
     stdout: StdioCollector { id: loginOut; waitForEnd: true }
     onStarted: {

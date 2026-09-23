@@ -9,8 +9,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "io.github.mishkinf.pushover"
-  ipcTarget: "pushover"
+  moduleName: "io.github.mishkinf.pullover"
+  ipcTarget: "pullover"
   manageIpc: false
 
   property int cursorIndex: 0
@@ -158,7 +158,10 @@ Panel {
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
       }
-      onActivateRequested: if (root.cursorActive) root.activateCursor()
+      // No cursorActive guard: `o` already acts on the first message without
+      // one, and Enter doing nothing until you press j once is a wart, not a
+      // feature.
+      onActivateRequested: root.activateCursor()
       onCloseRequested: root.close()
       onTabRequested: function (direction) { root.switchPanel(direction) }
       onTextKey: function (t) {
@@ -199,7 +202,7 @@ Panel {
 
           PanelHero {
             width: parent.width
-            title: "Pushover"
+            title: "Pullover"
             meta: !pushover.loggedIn && pushover.probed ? "Not signed in"
               : pushover.schemaUnsupported ? "Unsupported status schema"
               : pushover.connected ? (pushover.deviceName !== "" ? "Connected as " + pushover.deviceName : "Connected")
@@ -295,7 +298,7 @@ Panel {
             textFormat: Text.PlainText
             visible: pushover.clientMissing
             width: parent.width
-            text: "The client is not installed. Run ./setup in the plugin folder:\n~/.config/omarchy/plugins/io.github.mishkinf.pushover"
+            text: "The client is not installed. Run ./setup in the plugin folder:\n~/.config/omarchy/plugins/io.github.mishkinf.pullover"
             color: root.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -319,7 +322,7 @@ Panel {
             Text {
               textFormat: Text.PlainText
               width: parent.width
-              text: "Your Pushover account. The password is exchanged for a device token and never stored."
+              text: "Sign in to Pushover. Your password is never stored \u2014 it is exchanged for an account session token, kept at mode 600."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -491,7 +494,7 @@ Panel {
             textFormat: Text.PlainText
             visible: !pushover.hasMessages && pushover.loggedIn && pushover.serviceActive
             width: parent.width
-            text: "No pushes yet. Anything sent to your Pushover account will arrive here."
+            text: "No pushes yet. Anything sent to this device will arrive here."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body

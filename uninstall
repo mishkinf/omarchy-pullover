@@ -1,42 +1,47 @@
 #!/bin/bash
 # Undoes setup. Leaves the plugin folder alone -- `omarchy plugin remove` owns
-# that -- and leaves your Pushover account alone unless you ask.
+# that -- and leaves your Pushover account alone.
 #
 #   ./uninstall              stop and remove the client, keep the login
-#   ./uninstall --forget     also sign this machine out of Pushover
+#   ./uninstall --forget     also delete the stored credentials
 
 set -euo pipefail
 
 forget=0
 [[ ${1:-} == --forget ]] && forget=1
 
-if [[ $forget == 1 ]] && command -v pushover-open-client >/dev/null 2>&1; then
-  # Sign out first: it needs the credentials that are about to be deleted.
-  pushover-open-client logout >/dev/null 2>&1 || true
-fi
-
-systemctl --user disable --now pushover-open-client.service 2>/dev/null || true
-unlink "$HOME/.config/systemd/user/pushover-open-client.service" 2>/dev/null || true
+systemctl --user disable --now pullover.service 2>/dev/null || true
+unlink "$HOME/.config/systemd/user/pullover.service" 2>/dev/null || true
 systemctl --user daemon-reload 2>/dev/null || true
-unlink "$HOME/.local/bin/pushover-open-client" 2>/dev/null || true
+unlink "$HOME/.local/bin/pullover" 2>/dev/null || true
 
-# Cached app icons and the widget's state file. Both are derived data that the
-# client rebuilds; neither holds the login.
-find "${XDG_STATE_HOME:-$HOME/.local/state}/pushover" -mindepth 1 -delete 2>/dev/null || true
-rmdir "${XDG_STATE_HOME:-$HOME/.local/state}/pushover" 2>/dev/null || true
-find "${XDG_CACHE_HOME:-$HOME/.cache}/pushover" -mindepth 1 -delete 2>/dev/null || true
-rmdir "${XDG_CACHE_HOME:-$HOME/.cache}/pushover" 2>/dev/null || true
+# Cached app icons and the widget's state. Derived data the client rebuilds;
+# neither holds the login.
+find "${XDG_STATE_HOME:-$HOME/.local/state}/pullover" -mindepth 1 -delete 2>/dev/null || true
+rmdir "${XDG_STATE_HOME:-$HOME/.local/state}/pullover" 2>/dev/null || true
+find "${XDG_CACHE_HOME:-$HOME/.cache}/pullover" -mindepth 1 -delete 2>/dev/null || true
+rmdir "${XDG_CACHE_HOME:-$HOME/.cache}/pullover" 2>/dev/null || true
 
-config="${XDG_CONFIG_HOME:-$HOME/.config}/pushover"
+config="${XDG_CONFIG_HOME:-$HOME/.config}/pullover"
 if [[ $forget == 1 ]]; then
   find "$config" -mindepth 1 -delete 2>/dev/null || true
   rmdir "$config" 2>/dev/null || true
-  echo "Removed the client and signed this machine out of Pushover."
+  echo "Removed the client and deleted the stored credentials."
 else
   echo "Removed the client. Your login is still in $config —"
   echo "re-run ./setup to pick up where you left off, or ./uninstall --forget to clear it."
 fi
 
-echo
-echo "Remove the widget and the plugin itself with:"
-echo "  omarchy plugin remove io.github.mishkinf.pushover"
+cat <<'MSG'
+
+Two things this deliberately does NOT do:
+
+  * The device stays registered on your Pushover account. The Open Client API
+    documents no way to remove one, so retire it yourself at
+    https://pushover.net/devices — it holds one of your ten device slots.
+  * python-websockets, python-requests and libnotify stay installed. Other
+    things may use them; remove them with pacman if you want them gone.
+
+Remove the widget and the plugin itself with:
+  omarchy plugin remove io.github.mishkinf.pullover
+MSG

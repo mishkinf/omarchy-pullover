@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Receive Pushover pushes on the Linux desktop.
+"""Pullover - an unofficial Pushover Open Client for Omarchy.
+
+Not released or supported by Pushover.
 
 Pushover has no Linux app. What it has is the Open Client API: register this
 machine as a device, hold a websocket to client.pushover.net, and every push
@@ -24,6 +26,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -32,10 +35,10 @@ from pathlib import Path
 try:
     import requests
 except ImportError:  # pragma: no cover - the setup script installs this
-    sys.exit("pushover-open-client: python-requests is not installed (pacman -S python-requests)")
+    sys.exit("pullover: python-requests is not installed (pacman -S python-requests)")
 
-VERSION = "1.2.0"
-USER_AGENT = f"omarchy-pushover-open-client/{VERSION} (Linux)"
+VERSION = "2.0.0"
+USER_AGENT = f"omarchy-pullover/{VERSION} (Linux)"
 
 API = "https://api.pushover.net/1"
 WEBSOCKET_URL = "wss://client.pushover.net/push"
@@ -52,6 +55,10 @@ SILENCE_TIMEOUT = 120.0
 RECONNECT_MIN = 5.0
 RECONNECT_MAX = 300.0
 HTTP_TIMEOUT = 30.0
+# Icons are cosmetic and fetched inline, so they get a far shorter leash than
+# the calls that carry actual messages.
+ICON_TIMEOUT = 5.0
+MAX_CACHED_ICONS = 200
 MESSAGE_HISTORY = 50
 
 # Pushover's own trial length. There is no API for licence or trial status --
@@ -117,17 +124,17 @@ def suggested_device_name() -> str:
 
 def config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
-    return Path(base) / "pushover"
+    return Path(base) / "pullover"
 
 
 def state_dir() -> Path:
     base = os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
-    return Path(base) / "pushover"
+    return Path(base) / "pullover"
 
 
 def cache_dir() -> Path:
     base = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
-    return Path(base) / "pushover" / "icons"
+    return Path(base) / "pullover" / "icons"
 
 
 CREDENTIALS_PATH = config_dir() / "credentials.json"
@@ -136,7 +143,36 @@ TRIAL_WARNED_PATH = state_dir() / "trial-warned.json"
 
 
 def log(message: str) -> None:
-    print(f"pushover: {message}", flush=True)
+    print(f"pullover: {message}", flush=True)
+
+
+_REDACTIONS: list[str] = []
+
+
+def register_secret(value: str) -> None:
+    """Values that must never reach the state file or the journal."""
+    if value and value not in _REDACTIONS:
+        _REDACTIONS.append(value)
+
+
+def redact(text: object) -> str:
+    """The secret is a GET query parameter, so requests' own exception messages
+    quote it back inside the URL -- and those messages were being written to
+    status.json and printed to the journal. Neither is mode 600 when `run` is
+    started by hand rather than by systemd."""
+    out = str(text)
+    for value in _REDACTIONS:
+        out = out.replace(value, "[redacted]")
+    return out
+
+
+def coerce_int(value: object, fallback: int = 0) -> int:
+    """Every number in a message is server-supplied and has been the wrong type
+    in practice. int() on a string id raised ValueError, which nothing caught."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 # --------------------------------------------------------------------------
@@ -146,18 +182,37 @@ def log(message: str) -> None:
 def load_credentials() -> dict:
     if not CREDENTIALS_PATH.exists():
         sys.exit(
-            "pushover-open-client: not logged in.\n"
-            "  Run: pushover-open-client login (or use the bar widget)"
+            "pullover: not logged in.\n"
+            "  Run: pullover login (or use the bar widget)"
         )
-    with CREDENTIALS_PATH.open() as handle:
-        creds = json.load(handle)
+    try:
+        with CREDENTIALS_PATH.open() as handle:
+            creds = json.load(handle)
+    except (OSError, ValueError) as error:
+        # Unguarded, a truncated credentials file was a traceback every 5
+        # seconds forever, and the helpful message below was unreachable.
+        sys.exit(
+            f"pullover: could not read {CREDENTIALS_PATH}: {error}\n"
+            "  Sign in again: pullover login --force"
+        )
+    if not isinstance(creds, dict):
+        sys.exit(f"pullover: {CREDENTIALS_PATH} is not valid credentials; sign in again")
     for field in ("secret", "device_id"):
         if not creds.get(field):
-            sys.exit(f"pushover-open-client: credentials.json is missing '{field}'; run login again")
+            sys.exit(f"pullover: credentials.json is missing '{field}'; run login again")
     return creds
 
 
 def save_credentials(creds: dict) -> None:
+    # The trial is dated from this file's mtime when registered_at is absent,
+    # and every rewrite (licensed, login --force) moves that mtime. Stamping the
+    # old mtime before the first rewrite freezes the real date; without it,
+    # `licensed --undo` on a legacy install silently restarted the countdown.
+    if not creds.get("registered_at"):
+        try:
+            creds = dict(creds, registered_at=int(CREDENTIALS_PATH.stat().st_mtime))
+        except OSError:
+            pass
     CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
     # Written through a 0600 temp file so the secret is never briefly readable.
     tmp = CREDENTIALS_PATH.with_suffix(".tmp")
@@ -185,7 +240,7 @@ def api_get(path: str, params: dict) -> requests.Response:
     )
 
 
-SERVICE = "pushover-open-client.service"
+SERVICE = "pullover.service"
 
 
 def perform_login(email: str, password: str, twofa: str, device_name: str, force: bool) -> dict:
@@ -223,7 +278,11 @@ def perform_login(email: str, password: str, twofa: str, device_name: str, force
     if not response.ok:
         return {"ok": False, "error": f"Login failed (HTTP {response.status_code})"}
 
-    secret = response.json().get("secret")
+    try:
+        secret = response.json().get("secret")
+    except ValueError:
+        # A captive portal answering 200 with HTML is exactly this.
+        return {"ok": False, "error": "Pushover returned something unreadable"}
     if not secret:
         return {"ok": False, "error": "Login succeeded but returned no secret"}
 
@@ -245,7 +304,10 @@ def perform_login(email: str, password: str, twofa: str, device_name: str, force
     if not response.ok:
         return {"ok": False, "error": f"Device registration failed (HTTP {response.status_code})"}
 
-    device_id = response.json().get("id")
+    try:
+        device_id = response.json().get("id")
+    except ValueError:
+        return {"ok": False, "error": "Pushover returned something unreadable"}
     if not device_id:
         return {"ok": False, "error": "Device registration returned no id"}
 
@@ -314,7 +376,7 @@ def cmd_login(args: argparse.Namespace) -> int:
         result = perform_login(email, password, twofa, device_name, args.force)
 
     if not result.get("ok"):
-        sys.exit(f"pushover-open-client: {result.get('error')}")
+        sys.exit(f"pullover: {result.get('error')}")
 
     print(f"\nRegistered this machine with Pushover as '{result['deviceName']}'.")
     print(f"Credentials: {CREDENTIALS_PATH} (mode 600)")
@@ -373,11 +435,23 @@ def cmd_licensed(args: argparse.Namespace) -> int:
 
 
 def cmd_logout(args: argparse.Namespace) -> int:
+    """Forgets the credentials on THIS machine. It cannot deregister the device:
+    the Open Client API documents no endpoint for removing one, so the device
+    stays on the account, keeps one of its ten slots, and must be retired by
+    hand at https://pushover.net/devices ."""
     systemctl("disable")
     systemctl("stop")
-    CREDENTIALS_PATH.unlink(missing_ok=True)
-    STATUS_PATH.unlink(missing_ok=True)
-    print(json.dumps({"ok": True}))
+    for path in (CREDENTIALS_PATH, STATUS_PATH, TRIAL_WARNED_PATH):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    print(json.dumps({
+        "ok": True,
+        "note": "Credentials removed from this machine. The device is still "
+                "registered on your Pushover account; retire it at "
+                "https://pushover.net/devices",
+    }))
     return 0
 
 
@@ -417,7 +491,7 @@ def icon_path(icon_name: str) -> str | None:
         response = requests.get(
             ICON_URL.format(name),
             headers={"User-Agent": USER_AGENT},
-            timeout=HTTP_TIMEOUT,
+            timeout=ICON_TIMEOUT,
         )
         if not response.ok or not response.content:
             return None
@@ -426,7 +500,10 @@ def icon_path(icon_name: str) -> str | None:
         tmp.write_bytes(response.content)
         os.replace(tmp, target)
         return str(target)
-    except requests.RequestException:
+    except (requests.RequestException, OSError):
+        # OSError matters as much as a network failure here: a full disk or a
+        # read-only cache used to raise straight out of notify(), out of
+        # sync_messages, and be reported as "connection lost".
         return None
 
 
@@ -446,17 +523,46 @@ def bypasses_dnd(priority: int) -> bool:
     return priority >= 1
 
 
+def option_safe(text: str) -> str:
+    """Keep an attacker-chosen positional out of option position.
+
+    omarchy-notification-send takes the headline as $1 AFTER its option loop,
+    so a title that is exactly a recognized flag is consumed as one: a title of
+    "--urgency" makes the sender exit 1 and display nothing, and
+    "--app-name=EvilCorp" spoofs the sender. A word joiner is invisible in the
+    toast and cannot begin an option. The description slot deliberately allows
+    a leading dash ("-50% off" is content), so this is applied to both only
+    because the same string can land in either slot."""
+    return "\u2060" + text if text.startswith("-") else text
+
+
+def url_is_openable(url: str) -> bool:
+    """The click action is handed to xdg-open, which will dispatch any scheme
+    registered on the machine. A push is attacker-influenced, so only the two
+    schemes a Pushover url is meant to carry are honoured."""
+    return url.startswith("https://") or url.startswith("http://")
+
+
 def notification_argv(message: dict, icon: str | None, native: bool) -> list[str]:
     app = str(message.get("app") or "Pushover")
     title = str(message.get("title") or app)
     body = body_for_notification(message)
-    priority = int(message.get("priority") or 0)
+    priority = coerce_int(message.get("priority"))
     url = str(message.get("url") or "")
 
     if not native:
         # Plain libnotify: no click action, and the app name always wins over
         # the DND bypass because notify-send cannot set Omarchy's hints.
-        argv = ["notify-send", "--app-name", app, "--urgency", urgency_for(priority)]
+        argv = ["notify-send", "--urgency", urgency_for(priority)]
+        # Omarchy grants notify-send the DND bypass only at critical urgency and
+        # only under that exact app name, so a high-priority push keeps the
+        # bypass here the same way it does on the native path: by giving up the
+        # app label rather than the delivery.
+        if bypasses_dnd(priority):
+            if app.lower() not in title.lower():
+                title = f"{app}: {title}"
+        else:
+            argv += ["--app-name", app]
         if priority >= 2:
             argv += ["--expire-time", "0"]
         if icon:
@@ -481,28 +587,46 @@ def notification_argv(message: dict, icon: str | None, native: bool) -> list[str
     if icon:
         argv += ["--icon", icon]
 
-    argv += [title, body]
+    argv += [option_safe(title), option_safe(body)]
 
     # A click opens the message's own URL. Omarchy carries this as data rather
     # than a libnotify action, so it still works on a toast restored after a
     # shell restart.
-    if url:
+    if url and url_is_openable(url):
         argv += ["--exec", "xdg-open", url]
     return argv
 
 
-def notify(message: dict) -> None:
-    native = shutil.which("omarchy-notification-send") is not None
-    if not native and not shutil.which("notify-send"):
-        log("neither omarchy-notification-send nor notify-send is installed")
-        return
-
-    icon = icon_path(str(message.get("icon") or "pushover"))
-    argv = notification_argv(message, icon, native)
+def _run_sender(argv: list[str]) -> int:
+    """Return the sender's exit code, or non-zero if it could not be run at all.
+    which() is a check-then-use, so the binary can still be gone by now."""
     try:
-        subprocess.run(argv, check=False, timeout=15)
+        return subprocess.run(argv, check=False, timeout=15).returncode
     except subprocess.TimeoutExpired:
         log("the notification command timed out")
+    except OSError as error:
+        log(f"could not run the notification command: {redact(error)}")
+    return 1
+
+
+def notify(message: dict) -> bool:
+    """True when a notification was displayed. The caller deletes the message
+    from Pushover after this, so a silent failure here loses it."""
+    native = shutil.which("omarchy-notification-send") is not None
+    have_fallback = shutil.which("notify-send") is not None
+    if not native and not have_fallback:
+        log("neither omarchy-notification-send nor notify-send is installed")
+        return False
+
+    icon = icon_path(str(message.get("icon") or "pushover"))
+
+    if native:
+        if _run_sender(notification_argv(message, icon, True)) == 0:
+            return True
+        log("the native sender failed; falling back to notify-send")
+    if have_fallback:
+        return _run_sender(notification_argv(message, icon, False)) == 0
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -539,7 +663,7 @@ class Status:
     def record(self, messages: list[dict]) -> None:
         for message in messages:
             self.messages.append({
-                "id": message.get("id"),
+                "id": coerce_int(message.get("id")),
                 # Pushover ids are 19 digits, past JavaScript's safe-integer
                 # range, so the widget compares these strings and never the
                 # number -- JSON.parse would silently round the number.
@@ -548,8 +672,8 @@ class Status:
                 "message": strip_html(str(message.get("message") or ""))
                 if message.get("html") else str(message.get("message") or ""),
                 "app": str(message.get("app") or "Pushover"),
-                "date": message.get("date"),
-                "priority": int(message.get("priority") or 0),
+                "date": coerce_int(message.get("date")),
+                "priority": coerce_int(message.get("priority")),
                 "url": str(message.get("url") or ""),
                 "urlTitle": str(message.get("url_title") or ""),
                 "receipt": str(message.get("receipt") or ""),
@@ -557,12 +681,20 @@ class Status:
             })
         # Newest first, and only a window of them: this file is read by the bar
         # on every change, so it stays small on purpose.
-        self.messages = sorted(
-            self.messages, key=lambda m: m.get("date") or 0, reverse=True
-        )[:MESSAGE_HISTORY]
+        # Deduplicated by id: a failed update_highest_message re-delivers the
+        # same batch, and without this the history fills with copies that evict
+        # real messages out of the window and skew the widget's unread count.
+        seen = set()
+        unique = []
+        for message in sorted(self.messages, key=lambda m: coerce_int(m.get("date")), reverse=True):
+            key = message.get("idStr") or str(message.get("id"))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(message)
+        self.messages = unique[:MESSAGE_HISTORY]
 
     def write(self) -> None:
-        STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schemaVersion": 1,
             "connected": self.connected,
@@ -571,15 +703,26 @@ class Status:
             "updatedAt": int(time.time()),
             "messages": self.messages,
         }
-        tmp = STATUS_PATH.with_suffix(".tmp")
         # Atomic rename: the widget watches this path, and a half-written file
         # would read to it as a corrupt daemon rather than a slow one.
-        tmp.write_text(json.dumps(payload, indent=2))
-        os.replace(tmp, STATUS_PATH)
+        #
+        # Failures are swallowed on purpose. write() is called from inside the
+        # reconnect handler, so an OSError raised here would escape every
+        # `except` above it and end the process over a cosmetic file.
+        try:
+            STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = STATUS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, indent=2))
+            os.replace(tmp, STATUS_PATH)
+        except OSError as error:
+            log(f"could not write the status file: {redact(error)}")
 
     def clear(self) -> None:
         # An absent file is how the widget knows the daemon is not running.
-        STATUS_PATH.unlink(missing_ok=True)
+        try:
+            STATUS_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -590,7 +733,12 @@ class Client:
     def __init__(self, creds: dict) -> None:
         self.secret = creds["secret"]
         self.device_id = creds["device_id"]
-        self._trial_checked_at = 0.0
+        self._trial_checked_at: float | None = None
+        # Set once a frame has actually arrived. A connection that completes the
+        # handshake and dies immediately used to reset the backoff, so a
+        # flapping server was retried every 5s forever and RECONNECT_MAX was
+        # unreachable.
+        self.proved = False
         self.status = Status()
         self.status.device_name = creds.get("device_name") or ""
         self.status.load()
@@ -601,8 +749,11 @@ class Client:
         An unlicensed device just stops receiving -- no notice, no error the
         user sees -- so the one failure worth engineering against here is
         finding out by missing something."""
+        # None, not 0.0: time.monotonic() is seconds since boot on Linux, so
+        # `now - 0.0 < 3600` is true for the first hour of every uptime and the
+        # check silently never ran -- including the one at connect time.
         now = time.monotonic()
-        if now - self._trial_checked_at < 3600:
+        if self._trial_checked_at is not None and now - self._trial_checked_at < 3600:
             return
         self._trial_checked_at = now
 
@@ -615,35 +766,54 @@ class Client:
         except (OSError, ValueError):
             warned = set()
 
-        remaining = int(trial.get("daysRemaining") or 0)
-        for threshold in sorted(TRIAL_WARN_AT_DAYS):
-            if remaining > threshold or threshold in warned:
-                continue
-            if threshold == 0:
-                title = "Pushover trial has ended"
-                body = ("This device may stop receiving. A one-time $4.99 desktop "
-                        "licence keeps it working: https://pushover.net/clients/desktop")
-            else:
-                title = f"Pushover trial ends in {remaining} day{'s' if remaining != 1 else ''}"
-                body = ("After that this device stops receiving. A one-time $4.99 "
-                        "licence: https://pushover.net/clients/desktop")
-            notify({
-                "title": title,
-                "message": body,
-                "app": "Pushover",
-                "priority": 1,
-                "url": "https://pushover.net/clients/desktop",
-                "url_title": "Buy the licence",
-            })
-            warned.add(threshold)
-            try:
-                TRIAL_WARNED_PATH.parent.mkdir(parents=True, exist_ok=True)
-                TRIAL_WARNED_PATH.write_text(json.dumps(sorted(warned)))
-            except OSError:
-                pass
-            break
+        remaining = coerce_int(trial.get("daysRemaining"))
+
+        # Every threshold at or below the current remaining has been passed.
+        # Burning all of them at once, rather than one per tick, is what stops a
+        # late first start announcing "7 days" this hour and "1 day" the next --
+        # and stops the nonsense line "trial ends in 0 days".
+        crossed = {t for t in TRIAL_WARN_AT_DAYS if remaining <= t}
+        if not crossed - warned:
+            return
+
+        if remaining <= 0:
+            title = "Trial has ended"
+            body = ("This device may stop receiving Pushover messages. A one-time "
+                    "$4.99 desktop licence keeps it working.")
+        else:
+            title = f"Trial ends in {remaining} day{'s' if remaining != 1 else ''}"
+            body = ("After that this device stops receiving Pushover messages. "
+                    "A one-time $4.99 licence keeps it working.")
+
+        notify({
+            "title": title,
+            "message": body,
+            "app": "Pullover",
+            "priority": 1,
+            "url": "https://pushover.net/clients/desktop",
+            "url_title": "Buy the licence",
+        })
+
+        warned |= crossed
+        try:
+            TRIAL_WARNED_PATH.parent.mkdir(parents=True, exist_ok=True)
+            TRIAL_WARNED_PATH.write_text(json.dumps(sorted(warned)))
+        except OSError:
+            pass
 
     def sync_messages(self) -> None:
+        """Never raises. A malformed field in a server payload used to escape
+        run()'s three-exception handler, kill the process, and have systemd
+        restart it into the same batch every 5 seconds forever -- re-notifying
+        each time, because the delete had not been reached."""
+        try:
+            self._sync_messages()
+        except Exception as error:  # noqa: BLE001 - see the docstring
+            self.status.last_error = f"could not process messages: {redact(error)}"
+            self.status.write()
+            log(self.status.last_error)
+
+    def _sync_messages(self) -> None:
         """Download everything queued, show it, then tell the server it landed.
 
         The delete is only sent after the notifications are out, so a crash
@@ -661,12 +831,28 @@ class Client:
             return
 
         log(f"{len(messages)} new message(s)")
+        undisplayed = 0
         for message in messages:
-            notify(message)
+            if not notify(message):
+                undisplayed += 1
+
         self.status.record(messages)
+        if undisplayed:
+            # The watermark below is all-or-nothing, so a message whose toast
+            # failed cannot be left on the server without re-showing every
+            # message beside it on the next sync. It is recorded above instead,
+            # so it is still in the panel -- unseen, not lost.
+            self.status.last_error = (
+                f"{undisplayed} notification(s) could not be displayed; "
+                "they are listed here instead."
+            )
         self.status.write()
 
-        highest = max(int(m["id"]) for m in messages if m.get("id") is not None)
+        ids = [coerce_int(m.get("id")) for m in messages]
+        highest = max([i for i in ids if i > 0], default=0)
+        if highest <= 0:
+            log("no usable message id in this batch; not advancing the watermark")
+            return
         response = api_post(
             f"devices/{self.device_id}/update_highest_message.json",
             {"secret": self.secret, "message": highest},
@@ -692,14 +878,19 @@ class Client:
                     self.status.last_error = ""
                     self.status.write()
                     log("connected")
-                    backoff = RECONNECT_MIN
+                    self.proved = False
 
                     # Anything that arrived while we were disconnected is
                     # waiting on the server, and the socket will not announce it.
-                    self.sync_messages()
+                    # Off the event loop: a backlog of messages is a blocking
+                    # HTTPS call plus a subprocess per message, and nothing
+                    # would service the socket or the watchdog meanwhile.
+                    await asyncio.to_thread(self.sync_messages)
                     self.maybe_warn_about_trial()
 
                     verdict = await self.listen(socket)
+                    if self.proved:
+                        backoff = RECONNECT_MIN
                     if verdict is not None:
                         return verdict
 
@@ -723,14 +914,31 @@ class Client:
 
             if isinstance(frame, bytes):
                 frame = frame.decode("utf-8", "replace")
-            code = frame[:1]
+
+            # Every byte, not just the first. The protocol is documented as one
+            # byte per frame, but that is a claim about the server: a frame of
+            # "#!" read as a bare keepalive would have dropped the push until
+            # the next event or the 120s watchdog, silently.
+            codes = set(frame)
+            self.proved = True
+
+            if "E" in codes or "A" in codes:
+                code = "E" if "E" in codes else "A"
+            elif "R" in codes:
+                code = "R"
+            elif "!" in codes:
+                code = "!"
+            elif "#" in codes:
+                code = "#"
+            else:
+                code = frame[:1]
 
             if code == "#":
                 # The keepalive is the only regular tick this process gets.
                 self.maybe_warn_about_trial()
                 continue
             if code == "!":
-                self.sync_messages()
+                await asyncio.to_thread(self.sync_messages)
                 continue
             if code == "R":
                 log("server asked for a reconnect")
@@ -768,27 +976,45 @@ class Client:
 
 def cmd_run(args: argparse.Namespace) -> int:
     creds = load_credentials()
+    register_secret(creds["secret"])
     client = Client(creds)
+
+    # systemd stops this with SIGTERM, whose default action skips `finally`
+    # entirely -- so status.json survived every normal stop still saying
+    # "connected": true, and the widget believed it indefinitely.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    code = 1
     try:
-        return asyncio.run(client.run())
-    except KeyboardInterrupt:
+        code = asyncio.run(client.run())
+        return code
+    except (KeyboardInterrupt, SystemExit):
+        code = 0
         return 0
     finally:
-        client.status.clear()
+        # A terminal exit carries the only explanation the user will get, and
+        # deleting the file here used to throw it away microseconds after it
+        # was written. Everything else clears, because an absent file is how
+        # the widget knows nothing is running.
+        if code in (EXIT_REAUTH, EXIT_OTHER_SESSION):
+            client.status.connected = False
+            client.status.write()
+        else:
+            client.status.clear()
 
 
 def cmd_ack(args: argparse.Namespace) -> int:
     creds = load_credentials()
     response = api_post(f"receipts/{args.receipt}/acknowledge.json", {"secret": creds["secret"]})
     if not response.ok:
-        sys.exit(f"pushover-open-client: acknowledge failed (HTTP {response.status_code}): {response.text[:200]}")
+        sys.exit(f"pullover: acknowledge failed (HTTP {response.status_code}): {response.text[:200]}")
     print("acknowledged")
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     if not STATUS_PATH.exists():
-        print("pushover-open-client: not running (no status file)")
+        print("pullover: not running (no status file)")
         return 1
     print(STATUS_PATH.read_text())
     return 0
@@ -808,7 +1034,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="pushover-open-client", description=__doc__)
+    parser = argparse.ArgumentParser(prog="pullover", description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
     sub = parser.add_subparsers(dest="command", required=True)
 

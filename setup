@@ -7,16 +7,36 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")" && pwd)
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+
+# --- migration from the pre-2.0 name -----------------------------------------
+# Pushover's Open Client terms forbid using their name in a client's name, so
+# everything this plugin owns was renamed to "pullover" in 2.0. Carry the
+# existing login across rather than making people sign in again.
+if [[ -d $config_home/pushover && ! -d $config_home/pullover ]]; then
+  systemctl --user disable --now pushover-open-client.service 2>/dev/null || true
+  unlink "$HOME/.config/systemd/user/pushover-open-client.service" 2>/dev/null || true
+  unlink "$HOME/.local/bin/pushover-open-client" 2>/dev/null || true
+  mv "$config_home/pushover" "$config_home/pullover"
+  [[ -d $state_home/pushover ]] && mv "$state_home/pushover" "$state_home/pullover"
+  [[ -d $cache_home/pushover ]] && mv "$cache_home/pushover" "$cache_home/pullover"
+  systemctl --user daemon-reload 2>/dev/null || true
+  echo "Migrated your existing login from the previous name."
+fi
 
 if command -v omarchy >/dev/null 2>&1; then
+  # Installed system-wide with pacman, and deliberately NOT removed by
+  # ./uninstall -- other things may use them.
   omarchy pkg add python-websockets python-requests libnotify
 else
   echo "omarchy not found; install python-websockets, python-requests and libnotify yourself." >&2
 fi
 
-install -Dm755 "$root/bin/pushover-open-client" "$HOME/.local/bin/pushover-open-client"
-install -Dm644 "$root/systemd/pushover-open-client.service" \
-  "$HOME/.config/systemd/user/pushover-open-client.service"
+install -Dm755 "$root/bin/pullover" "$HOME/.local/bin/pullover"
+install -Dm644 "$root/systemd/pullover.service" \
+  "$HOME/.config/systemd/user/pullover.service"
 systemctl --user daemon-reload
 
 case ":$PATH:" in
@@ -24,21 +44,21 @@ case ":$PATH:" in
   *) echo "note: $HOME/.local/bin is not on your PATH; the CLI will not be found in a shell." >&2 ;;
 esac
 
-if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/pushover/credentials.json" ]]; then
+if [[ -f $config_home/pullover/credentials.json ]]; then
   # restart rather than `enable --now`: an already-running daemon would
   # otherwise keep serving the old script after an update.
-  systemctl --user enable pushover-open-client.service
-  systemctl --user restart pushover-open-client.service
-  echo "Pushover client restarted on the new version."
+  systemctl --user enable pullover.service
+  systemctl --user restart pullover.service
+  echo "Pullover restarted on the new version."
 else
   cat <<'MSG'
 
 Installed.
 
-  omarchy plugin enable io.github.mishkinf.pushover --section right
+  omarchy plugin enable io.github.mishkinf.pullover --section right
 
 Then click the bell in the bar and sign in there. Pushover for Desktop is free
-for 30 days, then a one-time $4.99 licence on your account:
+for 30 days, then a one-time $4.99 licence on your Pushover account:
 https://pushover.net/clients/desktop
 MSG
 fi

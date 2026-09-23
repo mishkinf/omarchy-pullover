@@ -1,5 +1,5 @@
 [Unit]
-Description=Pushover Open Client
+Description=Pullover (unofficial Pushover Open Client)
 Documentation=https://pushover.net/api/client
 # notify-send needs the session bus, which arrives with the graphical session.
 After=graphical-session.target
@@ -7,7 +7,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/pushover-open-client run
+ExecStart=%h/.local/bin/pullover run
 Restart=always
 RestartSec=5
 # 78 is "Pushover rejected this device", 79 is "logged in elsewhere". Both need
