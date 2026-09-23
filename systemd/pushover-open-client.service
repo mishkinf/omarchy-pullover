@@ -1,0 +1,22 @@
+[Unit]
+Description=Pushover Open Client
+Documentation=https://pushover.net/api/client
+# notify-send needs the session bus, which arrives with the graphical session.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pushover-open-client run
+Restart=always
+RestartSec=5
+# 78 is "Pushover rejected this device", 79 is "logged in elsewhere". Both need
+# a human, and restarting would only retry credentials that cannot work.
+RestartPreventExitStatus=78 79
+
+# The credentials file holds a session secret for the whole Pushover account.
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

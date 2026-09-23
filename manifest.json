@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mishkinf.pushover",
+  "name": "Pushover",
+  "version": "1.0.0",
+  "author": "Mishkin Faustini",
+  "license": "MIT",
+  "description": "Pushover pushes as native desktop notifications, plus a bar widget with unread count and recent-message history. Uses Pushover's Open Client API, so every push that reaches the phone reaches this machine.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Pushover",
+    "description": "Unread count in the bar, recent pushes in the panel, emergency acknowledgement without reaching for the phone.",
+    "category": "Notifications",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "hideWhenIdle": false,
+      "maxVisible": 12
+    },
+    "schema": [
+      {
+        "key": "hideWhenIdle",
+        "type": "boolean",
+        "label": "Hide the icon when the client is not running",
+        "defaultValue": false
+      },
+      {
+        "key": "maxVisible",
+        "type": "number",
+        "label": "Messages shown in the panel",
+        "description": "The client keeps the last 50; this is how many the panel lists.",
+        "defaultValue": 12
+      }
+    ]
+  }
+}

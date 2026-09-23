@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""Receive Pushover pushes on the Linux desktop.
+
+Pushover has no Linux app. What it has is the Open Client API: register this
+machine as a device, hold a websocket to client.pushover.net, and every push
+that would reach the phone or the Mac app arrives here too. This is the whole
+client -- login, the socket, the desktop notification, and the state file the
+Omarchy bar widget reads.
+
+The websocket carries no message content. It carries single bytes that mean
+"something changed"; the messages themselves come over HTTPS. So the socket
+going quiet is indistinguishable from nothing happening, which is why there is
+a watchdog rather than a trust in the connection staying up.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import getpass
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - the setup script installs this
+    sys.exit("pushover-open-client: python-requests is not installed (pacman -S python-requests)")
+
+VERSION = "1.0.0"
+USER_AGENT = f"omarchy-pushover-open-client/{VERSION} (Linux)"
+
+API = "https://api.pushover.net/1"
+WEBSOCKET_URL = "wss://client.pushover.net/push"
+ICON_URL = "https://api.pushover.net/icons/{}.png"
+
+# Exit codes systemd is told never to restart on: both mean a human has to act,
+# and restarting would hammer the API with credentials that cannot work.
+EXIT_REAUTH = 78       # the server rejected our credentials for good
+EXIT_OTHER_SESSION = 79  # this device id logged in somewhere else
+
+# The server sends '#' on its own schedule. Longer than any keepalive gap we
+# have seen, short enough that a silently dead socket is noticed within minutes.
+SILENCE_TIMEOUT = 120.0
+RECONNECT_MIN = 5.0
+RECONNECT_MAX = 300.0
+HTTP_TIMEOUT = 30.0
+MESSAGE_HISTORY = 50
+
+
+def config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "pushover"
+
+
+def state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
+    return Path(base) / "pushover"
+
+
+def cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+    return Path(base) / "pushover" / "icons"
+
+
+CREDENTIALS_PATH = config_dir() / "credentials.json"
+STATUS_PATH = state_dir() / "status.json"
+
+
+def log(message: str) -> None:
+    print(f"pushover: {message}", flush=True)
+
+
+# --------------------------------------------------------------------------
+# credentials
+
+
+def load_credentials() -> dict:
+    if not CREDENTIALS_PATH.exists():
+        sys.exit(
+            "pushover-open-client: not logged in.\n"
+            "  Run: pushover-open-client login"
+        )
+    with CREDENTIALS_PATH.open() as handle:
+        creds = json.load(handle)
+    for field in ("secret", "device_id"):
+        if not creds.get(field):
+            sys.exit(f"pushover-open-client: credentials.json is missing '{field}'; run login again")
+    return creds
+
+
+def save_credentials(creds: dict) -> None:
+    CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Written through a 0600 temp file so the secret is never briefly readable.
+    tmp = CREDENTIALS_PATH.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(creds, handle, indent=2)
+    os.replace(tmp, CREDENTIALS_PATH)
+
+
+def api_post(path: str, data: dict) -> requests.Response:
+    return requests.post(
+        f"{API}/{path}",
+        data=data,
+        headers={"User-Agent": USER_AGENT},
+        timeout=HTTP_TIMEOUT,
+    )
+
+
+def api_get(path: str, params: dict) -> requests.Response:
+    return requests.get(
+        f"{API}/{path}",
+        params=params,
+        headers={"User-Agent": USER_AGENT},
+        timeout=HTTP_TIMEOUT,
+    )
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    if CREDENTIALS_PATH.exists() and not args.force:
+        sys.exit(f"pushover-open-client: already logged in ({CREDENTIALS_PATH}). Pass --force to replace.")
+
+    email = args.email or input("Pushover email: ").strip()
+    password = getpass.getpass("Pushover password: ")
+
+    payload = {"email": email, "password": password}
+    response = api_post("users/login.json", payload)
+
+    # 412 is Pushover's "this account has two-factor on"; the same call is
+    # repeated with the code rather than a different endpoint.
+    if response.status_code == 412:
+        payload["twofa"] = input("Two-factor code: ").strip()
+        response = api_post("users/login.json", payload)
+
+    if response.status_code == 401:
+        sys.exit("pushover-open-client: login rejected. Check the email and password.")
+    if not response.ok:
+        sys.exit(f"pushover-open-client: login failed (HTTP {response.status_code}): {response.text[:200]}")
+
+    body = response.json()
+    secret = body.get("secret")
+    if not secret:
+        sys.exit(f"pushover-open-client: login response had no secret: {body}")
+
+    device_name = args.device_name
+    # Pushover's own constraint, enforced here so the failure is readable
+    # rather than a 400 from the API.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,25}", device_name):
+        sys.exit("pushover-open-client: device name must be 1-25 chars of letters, digits, _ or -")
+
+    response = api_post("devices.json", {"secret": secret, "name": device_name, "os": "O"})
+    if response.status_code == 400:
+        sys.exit(
+            f"pushover-open-client: could not register device '{device_name}': {response.text[:300]}\n"
+            "  A name already in use, or the 10-device account limit, both land here.\n"
+            "  Pick another with --device-name, or retire a device at https://pushover.net/devices"
+        )
+    if not response.ok:
+        sys.exit(f"pushover-open-client: device registration failed (HTTP {response.status_code}): {response.text[:200]}")
+
+    device_id = response.json().get("id")
+    if not device_id:
+        sys.exit(f"pushover-open-client: device response had no id: {response.text[:200]}")
+
+    save_credentials({"secret": secret, "device_id": device_id, "device_name": device_name})
+
+    print(f"\nRegistered this machine with Pushover as '{device_name}'.")
+    print(f"Credentials: {CREDENTIALS_PATH} (mode 600)")
+    print("\nPushover for Desktop is free for 30 days; after that it is a one-time $4.99")
+    print("licence on your account: https://pushover.net/clients/desktop")
+    print("\nStart receiving:  systemctl --user enable --now pushover-open-client.service")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# notifications
+
+
+def strip_html(text: str) -> str:
+    """Pushover's html=1 bodies carry a small tag subset. Notification daemons
+    disagree about markup, so the tags are dropped rather than translated."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def icon_path(icon_name: str) -> str | None:
+    """Fetch and cache the sending app's icon. A missing icon is cosmetic, so
+    every failure here returns None rather than raising."""
+    name = re.sub(r"[^A-Za-z0-9_-]", "", icon_name or "pushover") or "pushover"
+    target = cache_dir() / f"{name}.png"
+    if target.exists():
+        return str(target)
+    try:
+        response = requests.get(
+            ICON_URL.format(name),
+            headers={"User-Agent": USER_AGENT},
+            timeout=HTTP_TIMEOUT,
+        )
+        if not response.ok or not response.content:
+            return None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".tmp")
+        tmp.write_bytes(response.content)
+        os.replace(tmp, target)
+        return str(target)
+    except requests.RequestException:
+        return None
+
+
+def urgency_for(priority: int) -> str:
+    if priority <= -1:
+        return "low"
+    if priority >= 1:
+        return "critical"
+    return "normal"
+
+
+def notify(message: dict) -> None:
+    if not shutil.which("notify-send"):
+        log("notify-send is not installed; cannot show the notification")
+        return
+
+    app = str(message.get("app") or "Pushover")
+    title = str(message.get("title") or app)
+    body = str(message.get("message") or "")
+    if message.get("html"):
+        body = strip_html(body)
+
+    url = str(message.get("url") or "")
+    url_title = str(message.get("url_title") or "")
+    if url:
+        body = f"{body}\n{url_title or url}".strip()
+
+    priority = int(message.get("priority") or 0)
+    args = [
+        "notify-send",
+        "--app-name", app,
+        "--urgency", urgency_for(priority),
+    ]
+
+    # Emergency pushes are the ones that must not be missed, so they are the
+    # ones that do not time out on their own.
+    if priority >= 2:
+        args += ["--expire-time", "0"]
+
+    icon = icon_path(str(message.get("icon") or "pushover"))
+    if icon:
+        args += ["--icon", icon]
+
+    args += ["--", title, body]
+    try:
+        subprocess.run(args, check=False, timeout=15)
+    except subprocess.TimeoutExpired:
+        log("notify-send timed out")
+
+
+# --------------------------------------------------------------------------
+# state file the bar widget reads
+
+
+class Status:
+    def __init__(self) -> None:
+        self.connected = False
+        self.last_error = ""
+        self.device_name = ""
+        self.messages: list[dict] = []
+
+    def record(self, messages: list[dict]) -> None:
+        for message in messages:
+            self.messages.append({
+                "id": message.get("id"),
+                "title": str(message.get("title") or message.get("app") or "Pushover"),
+                "message": strip_html(str(message.get("message") or ""))
+                if message.get("html") else str(message.get("message") or ""),
+                "app": str(message.get("app") or "Pushover"),
+                "date": message.get("date"),
+                "priority": int(message.get("priority") or 0),
+                "url": str(message.get("url") or ""),
+                "urlTitle": str(message.get("url_title") or ""),
+                "receipt": str(message.get("receipt") or ""),
+                "acked": bool(message.get("acked")),
+            })
+        # Newest first, and only a window of them: this file is read by the bar
+        # on every change, so it stays small on purpose.
+        self.messages = sorted(
+            self.messages, key=lambda m: m.get("date") or 0, reverse=True
+        )[:MESSAGE_HISTORY]
+
+    def write(self) -> None:
+        STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schemaVersion": 1,
+            "connected": self.connected,
+            "lastError": self.last_error,
+            "deviceName": self.device_name,
+            "updatedAt": int(time.time()),
+            "messages": self.messages,
+        }
+        tmp = STATUS_PATH.with_suffix(".tmp")
+        # Atomic rename: the widget watches this path, and a half-written file
+        # would read to it as a corrupt daemon rather than a slow one.
+        tmp.write_text(json.dumps(payload, indent=2))
+        os.replace(tmp, STATUS_PATH)
+
+    def clear(self) -> None:
+        # An absent file is how the widget knows the daemon is not running.
+        STATUS_PATH.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------
+# the client
+
+
+class Client:
+    def __init__(self, creds: dict) -> None:
+        self.secret = creds["secret"]
+        self.device_id = creds["device_id"]
+        self.status = Status()
+        self.status.device_name = creds.get("device_name") or ""
+
+    def sync_messages(self) -> None:
+        """Download everything queued, show it, then tell the server it landed.
+
+        The delete is only sent after the notifications are out, so a crash
+        mid-sync re-shows a push rather than losing it. A duplicate
+        notification is a far cheaper failure than a missed one."""
+        response = api_get("messages.json", {"secret": self.secret, "device_id": self.device_id})
+        if not response.ok:
+            self.status.last_error = f"could not fetch messages (HTTP {response.status_code})"
+            self.status.write()
+            log(self.status.last_error)
+            return
+
+        messages = response.json().get("messages") or []
+        if not messages:
+            return
+
+        log(f"{len(messages)} new message(s)")
+        for message in messages:
+            notify(message)
+        self.status.record(messages)
+        self.status.write()
+
+        highest = max(int(m["id"]) for m in messages if m.get("id") is not None)
+        response = api_post(
+            f"devices/{self.device_id}/update_highest_message.json",
+            {"secret": self.secret, "message": highest},
+        )
+        if not response.ok:
+            # Not fatal: the same messages arrive again next sync, which shows
+            # as duplicates rather than as silence.
+            log(f"could not clear messages up to {highest} (HTTP {response.status_code})")
+
+    async def run(self) -> int:
+        from websockets.asyncio.client import connect
+        from websockets.exceptions import WebSocketException
+
+        backoff = RECONNECT_MIN
+        while True:
+            try:
+                # ping_interval is off because the server has its own keepalive
+                # ('#') and does not answer websocket pings; the library's
+                # pings would time out a perfectly healthy connection.
+                async with connect(WEBSOCKET_URL, ping_interval=None, user_agent_header=USER_AGENT) as socket:
+                    await socket.send(f"login:{self.device_id}:{self.secret}\n")
+                    self.status.connected = True
+                    self.status.last_error = ""
+                    self.status.write()
+                    log("connected")
+                    backoff = RECONNECT_MIN
+
+                    # Anything that arrived while we were disconnected is
+                    # waiting on the server, and the socket will not announce it.
+                    self.sync_messages()
+
+                    verdict = await self.listen(socket)
+                    if verdict is not None:
+                        return verdict
+
+            except (WebSocketException, OSError, requests.RequestException) as error:
+                self.status.connected = False
+                self.status.last_error = str(error) or error.__class__.__name__
+                self.status.write()
+                log(f"connection lost: {self.status.last_error}")
+
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_MAX)
+
+    async def listen(self, socket) -> int | None:
+        """Return None to reconnect, or an exit code to stop for good."""
+        while True:
+            try:
+                frame = await asyncio.wait_for(socket.recv(), timeout=SILENCE_TIMEOUT)
+            except asyncio.TimeoutError:
+                log(f"no keepalive for {SILENCE_TIMEOUT:.0f}s; reconnecting")
+                return None
+
+            if isinstance(frame, bytes):
+                frame = frame.decode("utf-8", "replace")
+            code = frame[:1]
+
+            if code == "#":
+                continue
+            if code == "!":
+                self.sync_messages()
+                continue
+            if code == "R":
+                log("server asked for a reconnect")
+                return None
+            if code == "E":
+                self.status.connected = False
+                self.status.last_error = "Pushover rejected this device. Run: pushover-open-client login --force"
+                self.status.write()
+                log(self.status.last_error)
+                notify({
+                    "title": "Pushover disconnected",
+                    "message": "This device was rejected. Run: pushover-open-client login --force",
+                    "app": "Pushover",
+                    "priority": 1,
+                })
+                return EXIT_REAUTH
+            if code == "A":
+                self.status.connected = False
+                self.status.last_error = "This device logged in from somewhere else."
+                self.status.write()
+                log(self.status.last_error)
+                return EXIT_OTHER_SESSION
+
+            log(f"unknown frame {frame!r}; reconnecting")
+            return None
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    creds = load_credentials()
+    client = Client(creds)
+    try:
+        return asyncio.run(client.run())
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        client.status.clear()
+
+
+def cmd_ack(args: argparse.Namespace) -> int:
+    creds = load_credentials()
+    response = api_post(f"receipts/{args.receipt}/acknowledge.json", {"secret": creds["secret"]})
+    if not response.ok:
+        sys.exit(f"pushover-open-client: acknowledge failed (HTTP {response.status_code}): {response.text[:200]}")
+    print("acknowledged")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    if not STATUS_PATH.exists():
+        print("pushover-open-client: not running (no status file)")
+        return 1
+    print(STATUS_PATH.read_text())
+    return 0
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    """Prove the notification path works without waiting for a real push."""
+    notify({
+        "title": "Pushover",
+        "message": "Notifications are wired up. This one is local, not from the server.",
+        "app": "Pushover",
+        "priority": 0,
+        "icon": "pushover",
+    })
+    print("sent a local test notification")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="pushover-open-client", description=__doc__)
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    login = sub.add_parser("login", help="register this machine as a Pushover device")
+    login.add_argument("--email", help="skip the email prompt")
+    login.add_argument("--device-name", default="omarchy", help="device name shown in Pushover (default: omarchy)")
+    login.add_argument("--force", action="store_true", help="replace existing credentials")
+    login.set_defaults(func=cmd_login)
+
+    run = sub.add_parser("run", help="hold the websocket and show notifications")
+    run.set_defaults(func=cmd_run)
+
+    ack = sub.add_parser("ack", help="acknowledge an emergency-priority push")
+    ack.add_argument("receipt")
+    ack.set_defaults(func=cmd_ack)
+
+    status = sub.add_parser("status", help="print the state file the bar widget reads")
+    status.set_defaults(func=cmd_status)
+
+    selftest = sub.add_parser("selftest", help="show a local test notification")
+    selftest.set_defaults(func=cmd_selftest)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
