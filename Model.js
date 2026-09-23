@@ -10,6 +10,7 @@ function parseStatus(raw) {
   var blank = {
     ok: false,
     schemaTooNew: false,
+    running: true,
     connected: false,
     lastError: "",
     deviceName: "",
@@ -40,6 +41,9 @@ function parseStatus(raw) {
   return {
     ok: true,
     schemaTooNew: false,
+    // Absent means running: a file written before this flag existed was only
+    // ever written by a live daemon.
+    running: data.running !== false,
     connected: data.connected === true,
     lastError: String(data.lastError || ""),
     deviceName: String(data.deviceName || ""),
@@ -55,7 +59,10 @@ function normalizeMessages(list) {
     var m = list[i]
     if (!m || typeof m !== "object") continue
     out.push({
-      id: Number(m.id || 0),
+      // No numeric `id` field: nothing reads it, and Number() on a 19-digit id
+      // is precisely the rounding this whole file exists to avoid. The string
+      // is the identity. The `|| m.id` fallback covers a status file written
+      // before idStr existed; the daemon backfills those on load.
       idStr: String(m.idStr || m.id || ""),
       title: String(m.title || m.app || "Pushover"),
       message: String(m.message || ""),
@@ -73,8 +80,12 @@ function normalizeMessages(list) {
 
 // Emergency pushes that nobody has acknowledged are the only ones the panel
 // offers an action for, so the test is named rather than inlined twice.
-function needsAck(message) {
-  return message.priority >= 2 && message.receipt !== "" && !message.acked
+function needsAck(message, acked) {
+  if (!message || message.priority < 2 || !message.receipt || message.acked) return false
+  // The server never tells us again: the message is deleted from our queue
+  // after the sync, so `acked` in status.json can only ever be what it was on
+  // arrival. Acknowledgement is therefore remembered here, like dismissal.
+  return !isDismissed(message.idStr, acked)
 }
 
 function priorityLabel(priority) {
@@ -110,6 +121,13 @@ function unreadCount(messages, lastSeenIdStr, dismissed) {
   }
   // The marked message aged out of the window, so everything held is new.
   return count
+}
+
+// Mirrors url_is_openable in bin/pullover. xdg-open dispatches any registered
+// scheme, and a push is attacker-influenced.
+function isOpenableUrl(url) {
+  var text = String(url || "")
+  return text.indexOf("https://") === 0 || text.indexOf("http://") === 0
 }
 
 function isDismissed(idStr, dismissed) {

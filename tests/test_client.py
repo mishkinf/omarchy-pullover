@@ -513,3 +513,23 @@ class CredentialRewrites(unittest.TestCase):
 
         self.assertEqual(before, 10)
         self.assertEqual(after, before)
+
+
+class HistorySurvivesARestart(unittest.TestCase):
+    def test_stopping_records_the_state_without_discarding_the_messages(self):
+        client.STATUS_PATH.unlink(missing_ok=True)
+        first = client.Status()
+        first.connected = True
+        first.record([{"id": 4, "idStr": "4", "title": "kept", "message": "m", "date": 1}])
+        first.write()
+        first.stopped()
+
+        written = json.loads(client.STATUS_PATH.read_text())
+        self.assertFalse(written["running"])
+        self.assertFalse(written["connected"])
+        self.assertEqual(len(written["messages"]), 1)
+
+        # Which is the whole point: the next process finds them.
+        second = client.Status()
+        second.load()
+        self.assertEqual([m["title"] for m in second.messages], ["kept"])

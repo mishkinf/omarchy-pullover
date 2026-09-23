@@ -108,3 +108,30 @@ test("the dismissed list is pruned to what the daemon still holds", () => {
   assert.deepEqual(Model.prunedDismissed(messages, ["a", "gone", "b"]), ["a", "b"]);
   assert.deepEqual(Model.prunedDismissed(messages, null), []);
 });
+
+test("only http(s) urls are openable, matching the daemon's gate", () => {
+  assert.equal(Model.isOpenableUrl("https://example.com"), true);
+  assert.equal(Model.isOpenableUrl("http://example.com"), true);
+  for (const hostile of ["file:///etc/passwd", "ssh://h", "javascript:alert(1)", "", null]) {
+    assert.equal(Model.isOpenableUrl(hostile), false, String(hostile));
+  }
+});
+
+test("an acknowledged emergency stops asking to be acknowledged", () => {
+  const msg = { idStr: "m1", priority: 2, receipt: "r", acked: false };
+  assert.equal(Model.needsAck(msg, []), true);
+  assert.equal(Model.needsAck(msg, ["m1"]), false);
+});
+
+test("a status file with no running flag reads as running", () => {
+  // Written by a daemon from before the flag existed.
+  const status = Model.parseStatus(JSON.stringify({ schemaVersion: 1, connected: true }));
+  assert.equal(status.running, true);
+  assert.equal(Model.parseStatus(JSON.stringify({ schemaVersion: 1, running: false })).running, false);
+});
+
+test("the id-string fallback covers a file written before idStr existed", () => {
+  // The one path where the invariant could break: no idStr, only a number.
+  const out = Model.normalizeMessages([{ id: "1182737485987742185", title: "t" }]);
+  assert.equal(out[0].idStr, "1182737485987742185");
+});

@@ -19,6 +19,7 @@ Item {
   property bool schemaUnsupported: false
   property string lastSeenIdStr: ""
   property var dismissedIds: []
+  property var ackedIds: []
   property var trial: ({})
   property string actionStatus: ""
 
@@ -44,6 +45,7 @@ Item {
   // having been looked at, which only the widget can know.
   readonly property string lastSeenPath: stateHome + "/last-seen"
   readonly property string dismissedPath: stateHome + "/dismissed"
+  readonly property string ackedPath: stateHome + "/acked"
 
   readonly property var liveMessages: Model.liveMessages(messages, dismissedIds)
   readonly property int unread: Model.unreadCount(messages, lastSeenIdStr, dismissedIds)
@@ -111,10 +113,21 @@ Item {
 
   function _writeDismissed(list) {
     dismissedIds = list
-    dismissedProcess.command = ["sh", "-c",
+    _write(dismissedPath, list, dismissedProcess)
+  }
+
+  function _write(path, list, process) {
+    process.command = ["sh", "-c",
       "mkdir -p \"$(dirname \"$1\")\" && printf '%s' \"$2\" > \"$1\"",
-      "sh", dismissedPath, list.join("\n")]
-    dismissedProcess.running = true
+      "sh", path, list.join("\n")]
+    process.running = true
+  }
+
+  // These are set optimistically before the write, so a silent failure would
+  // leave memory and disk disagreeing until the next shell restart.
+  function writeFailed(what) {
+    actionStatus = "Could not save " + what + "."
+    statusClear.restart()
   }
 
   function markLicensed() {
@@ -134,16 +147,25 @@ Item {
     markReadProcess.running = true
   }
 
-  function acknowledge(receipt) {
-    if (!receipt) return
+  function acknowledge(receipt, idStr) {
+    if (!receipt || ackProcess.running) return
     actionStatus = "Acknowledging…"
+    ackProcess.pendingId = String(idStr || "")
     ackProcess.command = ["pullover", "ack", String(receipt)]
     ackProcess.running = true
   }
 
+  // The daemon gates the identical value before handing it to xdg-open
+  // (url_is_openable in bin/pullover). Same data, same program: gate it here
+  // too, or a push carrying file:// is one Enter away from opening it.
   function openUrl(url) {
-    if (!url) return
-    openProcess.command = ["xdg-open", String(url)]
+    var target = String(url || "")
+    if (!Model.isOpenableUrl(target)) {
+      actionStatus = "That link is not an http(s) address."
+      statusClear.restart()
+      return
+    }
+    openProcess.command = ["xdg-open", target]
     openProcess.running = true
   }
 
@@ -157,7 +179,7 @@ Item {
       lastError = status.lastError
       return
     }
-    daemonRunning = true
+    daemonRunning = status.running
     schemaUnsupported = false
     connected = status.connected
     lastError = status.lastError
@@ -195,8 +217,15 @@ Item {
     onLoadFailed: root.lastSeenIdStr = ""
   }
 
-  Process { id: markReadProcess }
-  Process { id: dismissedProcess }
+  Process {
+    id: markReadProcess
+    onExited: function (code) { if (code !== 0) root.writeFailed("the read marker") }
+  }
+
+  Process {
+    id: dismissedProcess
+    onExited: function (code) { if (code !== 0) root.writeFailed("dismissals") }
+  }
 
   FileView {
     id: dismissedFile
@@ -288,10 +317,36 @@ Item {
 
   Process {
     id: ackProcess
+    property string pendingId: ""
     onExited: function (exitCode) {
       root.actionStatus = exitCode === 0 ? "Acknowledged" : "Could not acknowledge"
+      if (exitCode === 0 && pendingId !== "" && !Model.isDismissed(pendingId, root.ackedIds)) {
+        var next = root.ackedIds.slice()
+        next.push(pendingId)
+        root.ackedIds = next
+        root._write(root.ackedPath, Model.prunedDismissed(root.messages, next), ackedProcess)
+      }
+      pendingId = ""
       statusClear.restart()
     }
+  }
+
+  FileView {
+    id: ackedFile
+    path: root.ackedPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      var body = String(text()).trim()
+      root.ackedIds = body === "" ? [] : body.split("\n")
+    }
+    onLoadFailed: root.ackedIds = []
+  }
+
+  Process {
+    id: ackedProcess
+    onExited: function (code) { if (code !== 0) root.writeFailed("acknowledgements") }
   }
 
   Timer {

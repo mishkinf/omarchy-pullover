@@ -635,6 +635,7 @@ def notify(message: dict) -> bool:
 
 class Status:
     def __init__(self) -> None:
+        self.running = True
         self.connected = False
         self.last_error = ""
         self.device_name = ""
@@ -686,7 +687,12 @@ class Status:
         # real messages out of the window and skew the widget's unread count.
         seen = set()
         unique = []
-        for message in sorted(self.messages, key=lambda m: coerce_int(m.get("date")), reverse=True):
+        # Ordered by id, not date. Ids are assigned by Pushover in arrival
+        # order; `date` can be older on a delayed delivery, which sorted the
+        # message BELOW the read marker so it was born already-read and never
+        # raised the badge. Python's int is exact at 19 digits; the widget never
+        # does this comparison.
+        for message in sorted(self.messages, key=lambda m: coerce_int(m.get("id")), reverse=True):
             key = message.get("idStr") or str(message.get("id"))
             if key in seen:
                 continue
@@ -697,6 +703,7 @@ class Status:
     def write(self) -> None:
         payload = {
             "schemaVersion": 1,
+            "running": self.running,
             "connected": self.connected,
             "lastError": self.last_error,
             "deviceName": self.device_name,
@@ -717,8 +724,18 @@ class Status:
         except OSError as error:
             log(f"could not write the status file: {redact(error)}")
 
+    def stopped(self) -> None:
+        """Record that the daemon is down WITHOUT discarding what it holds.
+
+        Deleting the file on exit and adopting it on startup are incompatible:
+        together they wiped the panel's history on every restart, because
+        systemd's SIGTERM now reaches the `finally` that deleted it."""
+        self.running = False
+        self.connected = False
+        self.write()
+
     def clear(self) -> None:
-        # An absent file is how the widget knows the daemon is not running.
+        # Only on logout. An absent file still reads as "not running".
         try:
             STATUS_PATH.unlink(missing_ok=True)
         except OSError:
@@ -996,14 +1013,17 @@ def cmd_run(args: argparse.Namespace) -> int:
         # deleting the file here used to throw it away microseconds after it
         # was written. Everything else clears, because an absent file is how
         # the widget knows nothing is running.
-        if code in (EXIT_REAUTH, EXIT_OTHER_SESSION):
-            client.status.connected = False
-            client.status.write()
-        else:
-            client.status.clear()
+        # Never clear here: the history belongs to the user, not to this
+        # process, and a restart must not cost them their recent messages.
+        client.status.stopped()
 
 
 def cmd_ack(args: argparse.Namespace) -> int:
+    # The receipt is interpolated into a URL path, and the request carries the
+    # account secret. Pushover receipts are alphanumeric; anything else is
+    # refused rather than sent somewhere unintended.
+    if not re.fullmatch(r"[A-Za-z0-9]{1,64}", args.receipt or ""):
+        sys.exit("pullover: that is not a valid receipt id")
     creds = load_credentials()
     response = api_post(f"receipts/{args.receipt}/acknowledge.json", {"secret": creds["secret"]})
     if not response.ok:

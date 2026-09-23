@@ -111,7 +111,7 @@ pacman packages stay installed, since other things may use them.
 | Right-click | re-read the state |
 | `j` / `k` | move the cursor (the first press only shows it) |
 | `Enter` / `o` | open the selected message's URL, or acknowledge it if it has none |
-| `a` | acknowledge an emergency-priority push |
+| `a` | acknowledge an emergency-priority push (remembered locally — the server never tells us again) |
 | `d` | dismiss the selected message |
 | `r` | refresh |
 
@@ -196,7 +196,7 @@ somewhere a plugin can quietly behave badly:
 ./test
 ```
 
-73 tests — 59 Python, 14 Node — needing no network and no Pushover account.
+78 tests — 60 Python, 18 Node — needing no network and no Pushover account.
 They write only into a temp directory. The Node half is skipped if Node is not
 installed.
 
@@ -229,9 +229,22 @@ Each of these is a bug that actually happened here.
   pre-write content and un-reads what the user just looked at.
 - **`shouldBypassDnd` keys on the app NAME.** A nice app name silently costs you
   the DND bypass on critical pushes.
-- **Glyphs are surrogate pairs, not the ES6 brace form**, which this QML does
-  not parse; and a nerd-font icon's ink is wider than its one-cell advance, so
-  sizing a glyph box to the text's implicit width cuts it in half.
+- **A nerd-font icon's ink is wider than its one-cell advance**, so sizing a
+  glyph box to the text's implicit width cuts the icon in half. This is what a
+  broken-looking glyph almost always is here. (An earlier version of this file
+  blamed the `\u{...}` escape form instead. That was wrong: measured on
+  quickshell 0.3.1, the brace form and the surrogate pair are byte-identical.
+  Surrogate pairs are house style, not a workaround.)
+- **Deleting the state file on exit and adopting it on startup are
+  incompatible.** Together they wiped the panel's history on every restart, and
+  it only surfaced once a SIGTERM handler made the `finally` actually run. A
+  stopped daemon records `running: false` and keeps its messages.
+- **A binding read per row is read after the handler that zeroed it.** Marking
+  everything read on open made the unread emphasis permanently unreachable; the
+  count has to be captured before.
+- **Gate a value in every place it is used, not in the cleverest one.** The
+  daemon refused non-http schemes before handing a push URL to `xdg-open`; the
+  widget handed the same value to the same program ungated.
 - **A QML hot reload does not re-instantiate a `Loader`'s existing item.** Run
   `omarchy restart shell` before believing a screenshot.
 - **Pushover answers a bad login with 403.** Their docs do not state a code for

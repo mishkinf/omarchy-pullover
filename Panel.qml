@@ -16,17 +16,29 @@ Panel {
   property int cursorIndex: 0
   property bool cursorActive: false
   property int nowSeconds: Math.floor(Date.now() / 1000)
+  // Captured before markAllRead runs. `unread` is a binding that goes to zero
+  // the instant the panel opens, so reading it per row made the bold-title
+  // emphasis permanently unreachable.
+  property int unreadOnOpen: 0
 
   readonly property bool hideWhenIdle: setting("hideWhenIdle", false) === true
-  readonly property int maxVisible: Math.max(1, Number(setting("maxVisible", 12)))
+  readonly property int maxVisible: {
+    var value = Number(setting("maxVisible", 12))
+    // NaN from a non-numeric shell.json value would slice to an empty list
+    // while the header and Clear button still rendered.
+    return isNaN(value) ? 12 : Math.max(1, value)
+  }
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  // Surrogate pairs, not \u{...}: the shell's QML does not parse the ES6 form,
-  // and an unparsed escape renders as a broken box. U+F009A bell, U+F009B bell-off.
+  // U+F009A bell, U+F009B bell-off, written as surrogate pairs to match the
+  // shell's own convention (PolkitAgent.qml). The ES6 \u{...} form parses fine
+  // here -- measured byte-identical on quickshell 0.3.1 -- so this is house
+  // style, not a workaround. The broken box that prompted it was the icon
+  // sizing below, not the escape.
   readonly property string barGlyph: pushover.daemonRunning ? "\udb80\udc9a" : "\udb80\udc9b"
   readonly property color barIconColor: !pushover.daemonRunning
     ? Qt.darker(barForeground, 1.55)
@@ -44,13 +56,14 @@ Panel {
     if (panelFlick) panelFlick.contentY = 0
     nowSeconds = Math.floor(Date.now() / 1000)
     pushover.refresh()
+    unreadOnOpen = pushover.unread
     // Opening the panel is the act of reading, so the badge clears here and
     // not on arrival.
     pushover.markAllRead()
-    Qt.callLater(function () {
-      if (pushover.probed && !pushover.loggedIn) emailField.forceActiveFocus()
-      else keyCatcher.forceActiveFocus()
-    })
+    // A plain Qt.callLater loses: KeyboardPanel schedules its own
+    // focusTarget.forceActiveFocus() on the same tick and, being declared
+    // after this handler, runs last. The timer lands after both.
+    signInFocus.restart()
   }
 
   function moveCursor(dy) {
@@ -75,7 +88,7 @@ Panel {
     var message = currentMessage()
     if (!message) return
     if (message.url !== "") pushover.openUrl(message.url)
-    else if (Model.needsAck(message)) pushover.acknowledge(message.receipt)
+    else if (Model.needsAck(message, pushover.ackedIds)) pushover.acknowledge(message.receipt, message.idStr)
   }
 
   Service {
@@ -88,6 +101,8 @@ Panel {
     function open(): void { root.open() }
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
     function refresh(): string { pushover.refresh(); return "ok" }
     function unread(): string { return String(pushover.unread) }
   }
@@ -102,7 +117,10 @@ Panel {
           anchors.fill: parent
           text: root.barGlyph
           fontFamily: root.fontFamily
-          fontSize: Style.font.icon
+          // The bar's own token, as first-party bar glyphs use. Style.font.icon
+          // is a panel token: 1px larger, blind to a theme's bar.icon-font, and
+          // it scales differently when barScaleWithFont is off.
+          fontSize: button.fontSize
           color: root.barIconColor
         }
 
@@ -172,14 +190,14 @@ Panel {
           if (message && message.url !== "") pushover.openUrl(message.url)
         } else if (key === "a") {
           var target = root.currentMessage()
-          if (target && Model.needsAck(target)) pushover.acknowledge(target.receipt)
+          if (target && Model.needsAck(target, pushover.ackedIds)) pushover.acknowledge(target.receipt, target.idStr)
         } else if (key === "d") {
           var going = root.currentMessage()
           if (going) {
             pushover.dismiss(going.idStr)
             // The list shortens under the cursor, so it has to be pulled back
             // or it points past the end.
-            root.cursorIndex = Math.max(0, Math.min(root.cursorIndex, root.visibleMessages.length - 2))
+            root.cursorIndex = Math.max(0, Math.min(root.cursorIndex, root.visibleMessages.length - 1))
           }
         }
       }
@@ -509,6 +527,21 @@ Panel {
   // Relative timestamps go stale silently, so they are re-derived while the
   // panel is the thing being looked at.
   Timer {
+    id: signInFocus
+    interval: 1
+    onTriggered: {
+      if (pushover.probed && !pushover.loggedIn && !pushover.clientMissing) emailField.forceActiveFocus()
+      else keyCatcher.forceActiveFocus()
+    }
+  }
+
+  // Re-aim once the probe answers, since the first open happens before it does.
+  Connections {
+    target: pushover
+    function onProbedChanged() { if (root.opened) signInFocus.restart() }
+  }
+
+  Timer {
     interval: 30000
     running: root.opened
     repeat: true
@@ -520,10 +553,11 @@ Panel {
     property var message: ({})
     property int rowIndex: 0
 
-    readonly property bool emergency: Model.needsAck(message)
+    readonly property bool emergency: Model.needsAck(message, pushover.ackedIds)
     readonly property string priorityText: Model.priorityLabel(message.priority || 0)
-    // Position, not id: see the note on unreadCount in Model.js.
-    readonly property bool unread: rowIndex < pushover.unread
+    // Position, not id: see the note on unreadCount in Model.js. Against the
+    // count captured at open, not the live one, which is already zero by now.
+    readonly property bool unread: rowIndex < root.unreadOnOpen
 
     hasCursor: root.cursorActive && root.cursorIndex === rowIndex
     foreground: root.foreground
