@@ -184,6 +184,19 @@ Panel {
       onTabRequested: function (direction) { root.switchPanel(direction) }
       onTextKey: function (t) {
         var key = String(t).toLowerCase()
+        // Before the built-in keys, because an unconfigured install has none of
+        // these and a configured one cannot reach the reserved letters anyway
+        // (Model.handlerActions drops them).
+        var row = root.currentMessage()
+        if (row) {
+          var offered = Model.actionsFor(row, pushover.handlers)
+          for (var i = 0; i < offered.length; i++) {
+            if (offered[i].key === key) {
+              pushover.runAction(row.idStr, key)
+              return
+            }
+          }
+        }
         if (key === "r") pushover.refresh()
         else if (key === "o") {
           var message = root.currentMessage()
@@ -554,6 +567,7 @@ Panel {
     property int rowIndex: 0
 
     readonly property bool emergency: Model.needsAck(message, pushover.ackedIds)
+    readonly property var actions: Model.actionsFor(message, pushover.handlers)
     readonly property string priorityText: Model.priorityLabel(message.priority || 0)
     // Position, not id: see the note on unreadCount in Model.js. Against the
     // count captured at open, not the live one, which is already zero by now.
@@ -629,10 +643,19 @@ Panel {
       Text {
         textFormat: Text.PlainText
         Layout.fillWidth: true
-        visible: (messageRow.message.url || "") !== "" || messageRow.emergency
-        text: messageRow.emergency
-          ? ((messageRow.message.url || "") !== "" ? "Enter to open · a to acknowledge · d to dismiss" : "a to acknowledge · d to dismiss")
-          : (messageRow.message.urlTitle || messageRow.message.url || "")
+        visible: text !== ""
+        text: {
+          // An emergency says what the keys are, because acknowledging is the
+          // point of it. Everything else shows where Enter goes, and appends
+          // whatever extra keys this sender's handler offers.
+          var hint = Model.actionHint(messageRow.actions)
+          var hasUrl = (messageRow.message.url || "") !== ""
+          var base = messageRow.emergency
+            ? ((hasUrl ? "Enter to open · " : "") + "a to acknowledge · d to dismiss")
+            : (messageRow.message.urlTitle || messageRow.message.url || "")
+          if (hint === "") return base
+          return base === "" ? hint : base + " · " + hint
+        }
         color: messageRow.emergency ? root.urgent : Qt.darker(root.foreground, 2.0)
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption

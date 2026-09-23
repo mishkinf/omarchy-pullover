@@ -114,6 +114,7 @@ pacman packages stay installed, since other things may use them.
 | `a` | acknowledge an emergency-priority push (remembered locally — the server never tells us again) |
 | `d` | dismiss the selected message |
 | `r` | refresh |
+| anything else | a key from a [handler](#handlers-give-one-sender-its-own-keys), when the selected message's sender has one |
 
 Dismissing is this widget's own idea, like unread: the daemon keeps what
 arrived and the panel decides what is still worth showing. It changes nothing
@@ -137,6 +138,56 @@ omarchy bar set io.github.mishkinf.pullover hideWhenIdle true --json
 the JSON *string* `"true"`, and every widget in the shell — first-party ones
 included — tests `=== true`, so it silently does nothing. `maxVisible` is
 unaffected.
+
+### Handlers: give one sender its own keys
+
+A push from a particular application can offer extra actions beyond opening its
+URL — say, a monitoring alert that should start a local investigation rather
+than just a browser tab. Drop a `handlers.json` beside your credentials:
+
+```jsonc
+// ~/.config/pullover/handlers.json
+{
+  "schemaVersion": 1,
+  "handlers": [
+    {
+      "name": "my-alerts",
+      "match": { "app": "My Alerting Service" },
+      "actions": [
+        { "key": "i", "label": "Investigate", "run": ["/home/me/.local/bin/investigate"] }
+      ]
+    }
+  ]
+}
+```
+
+The panel then shows `i to investigate` on matching rows and runs the command
+when you press it. No file, or a broken one, means no handlers — never a broken
+panel.
+
+| field | |
+| --- | --- |
+| `match.app` | the push's `app` name, matched by **exact** case-folded equality |
+| `actions[].key` | one character, bound in the panel; `a c d j k` are reserved |
+| `actions[].run` | argv, run with no shell |
+| `toast` | optional: an action key to run when the **toast** is clicked, instead of opening the URL |
+
+**Your command is given exactly one argument: a path to a JSON file holding the
+whole message** (the same field names `pullover status` prints). Nothing from
+the push is ever interpolated into the command line — a push title contains
+whatever its sender put in it, and building a shell command out of that is how
+a notification becomes a local exploit. Read the file and decide what it means.
+
+The match is exact equality on a machine-set field, never a substring and never
+a pattern: `"My Alerting Service (staging)"` does **not** match
+`"My Alerting Service"`. That is deliberate. A looser test would let any sender
+who can name themselves convincingly run a command on your machine.
+
+```bash
+pullover handlers              # what is configured
+pullover handlers --id <id>    # what one message in the history resolves to
+pullover action i --id <id>    # run an action by hand
+```
 
 ### From a terminal
 
@@ -196,7 +247,7 @@ somewhere a plugin can quietly behave badly:
 ./test
 ```
 
-81 tests — 61 Python, 20 Node — needing no network and no Pushover account.
+98 tests — 72 Python, 26 Node — needing no network and no Pushover account.
 They write only into a temp directory. The Node half is skipped if Node is not
 installed.
 

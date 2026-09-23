@@ -151,3 +151,68 @@ test("clearing keeps earlier dismissals rather than replacing them", () => {
   // And with no history at all, nothing is discarded.
   assert.deepEqual(Model.prunedDismissed([], union), union);
 });
+
+// --- handlers ---------------------------------------------------------------
+
+const HANDLERS = JSON.stringify({
+  handlers: [{
+    name: "ridekick",
+    match: { app: "Ridekick Admin" },
+    actions: [{ key: "i", label: "Investigate with Claude", run: ["/bin/true"] }],
+  }],
+});
+
+test("a handler matches its sender by exact app name", () => {
+  const handlers = Model.parseHandlers(HANDLERS);
+  assert.equal(Model.actionsFor({ app: "Ridekick Admin" }, handlers).length, 1);
+  assert.equal(Model.actionsFor({ app: "ridekick admin" }, handlers).length, 1);
+});
+
+test("a sender that merely resembles the handler's gets nothing", () => {
+  const handlers = Model.parseHandlers(HANDLERS);
+  // The whole safety argument: substring matching would hand a local command
+  // to any sender that can put "Ridekick Admin" somewhere in its app name.
+  for (const app of ["Ridekick Admin (staging)", "Not Ridekick Admin", "Ridekick", "Pushover", ""]) {
+    assert.deepEqual(Model.actionsFor({ app }, handlers), [], app);
+  }
+});
+
+test("a handler cannot rebind a key the panel already spends", () => {
+  const handlers = Model.parseHandlers(JSON.stringify({
+    handlers: [{ match: { app: "X" }, actions: [
+      { key: "d", label: "Delete everything", run: ["/bin/true"] },
+      { key: "a", label: "Acknowledge", run: ["/bin/true"] },
+      { key: "z", label: "Fine", run: ["/bin/true"] },
+    ] }],
+  }));
+  assert.deepEqual(Model.actionsFor({ app: "X" }, handlers).map(a => a.key), ["z"]);
+});
+
+test("a malformed action is dropped without taking its siblings with it", () => {
+  const handlers = Model.parseHandlers(JSON.stringify({
+    handlers: [{ match: { app: "X" }, actions: [
+      { key: "q", label: "No command" },
+      { key: "qq", label: "Two characters", run: ["/bin/true"] },
+      { key: "w", label: "Empty command", run: [] },
+      { key: "e", label: "Good", run: ["/bin/true"] },
+      { key: "e", label: "Duplicate key", run: ["/bin/true"] },
+    ] }],
+  }));
+  assert.deepEqual(Model.actionsFor({ app: "X" }, handlers).map(a => a.key), ["e"]);
+});
+
+test("a broken handlers file disables handlers, not the panel", () => {
+  assert.deepEqual(Model.parseHandlers("{not json"), []);
+  assert.deepEqual(Model.parseHandlers(""), []);
+  assert.deepEqual(Model.parseHandlers("[]"), []);
+  assert.deepEqual(Model.parseHandlers('{"handlers":"nope"}'), []);
+});
+
+test("the hint names every key the row will answer to", () => {
+  const handlers = Model.parseHandlers(HANDLERS);
+  assert.equal(
+    Model.actionHint(Model.actionsFor({ app: "Ridekick Admin" }, handlers)),
+    "i to investigate with claude",
+  );
+  assert.equal(Model.actionHint([]), "");
+});

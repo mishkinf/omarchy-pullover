@@ -558,6 +558,183 @@ def url_is_openable(url: str) -> bool:
     return url.startswith("https://") or url.startswith("http://")
 
 
+# --------------------------------------------------------------------------
+# handlers: per-sender actions, from an optional config file
+
+
+HANDLERS_PATH = config_dir() / "handlers.json"
+# A key the panel already spends on something else cannot be rebound by a
+# config file: 'a' acknowledges, 'd' dismisses, 'c' clears, j/k move.
+RESERVED_ACTION_KEYS = frozenset("acdjk")
+
+
+def load_handlers() -> list[dict]:
+    """A malformed or unreadable handlers file disables HANDLERS, never the
+    client. A push arriving is the thing that must not depend on this."""
+    try:
+        raw = json.loads(HANDLERS_PATH.read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as error:
+        log(f"ignoring {HANDLERS_PATH}: {redact(error)}")
+        return []
+    handlers = raw.get("handlers") if isinstance(raw, dict) else None
+    if not isinstance(handlers, list):
+        return []
+    return [h for h in handlers if isinstance(h, dict)]
+
+
+def handler_for(message: dict) -> dict | None:
+    """The first handler whose match clause this message satisfies.
+
+    `app` is matched by EXACT equality, case-folded. Never a substring, never a
+    pattern. The field is set by the sending application through the Pushover
+    API, so equality is decidable and checkable -- whereas a substring test
+    would let "Ridekick Admin (staging)" claim to be "Ridekick Admin", and a
+    pattern would let anything that merely resembles a sender run a local
+    command. When it is wrong it is wrong in the safe direction: no match
+    means the message keeps its default behaviour, which is to open its URL.
+    """
+    app = str(message.get("app") or "").strip().casefold()
+    if not app:
+        return None
+    for handler in load_handlers():
+        match = handler.get("match")
+        if not isinstance(match, dict):
+            continue
+        want = match.get("app")
+        if isinstance(want, str) and want.strip().casefold() == app:
+            return handler
+    return None
+
+
+def handler_actions(handler: dict | None) -> list[dict]:
+    """The usable actions on a handler. An entry that is malformed, collides
+    with a panel key, or repeats a key already taken is dropped rather than
+    failing the rest."""
+    actions = (handler or {}).get("actions")
+    if not isinstance(actions, list):
+        return []
+    usable: list[dict] = []
+    seen: set[str] = set()
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        key = str(action.get("key") or "").strip().casefold()
+        run = action.get("run")
+        if len(key) != 1 or not key.isalnum() or key in RESERVED_ACTION_KEYS or key in seen:
+            continue
+        if not isinstance(run, list) or not run or not all(isinstance(a, str) and a for a in run):
+            continue
+        seen.add(key)
+        usable.append({"key": key, "label": str(action.get("label") or key), "run": list(run)})
+    return usable
+
+
+def toast_action(message: dict) -> dict | None:
+    """The action a click on the TOAST runs, when the handler names one.
+    Omarchy carries a single --exec, so naming one here replaces opening the
+    URL rather than sitting beside it."""
+    handler = handler_for(message)
+    if handler is None:
+        return None
+    want = str(handler.get("toast") or "").strip().casefold()
+    if not want:
+        return None
+    return next((a for a in handler_actions(handler) if a["key"] == want), None)
+
+
+def pullover_binary() -> str:
+    """An absolute path: the toast's --exec is re-run by the shell long after
+    this process is gone, with whatever PATH the shell happens to hold."""
+    return shutil.which("pullover") or str(Path(__file__).resolve())
+
+
+def action_payload_dir() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    return Path(base) / "pullover" if base else state_dir() / "actions"
+
+
+def write_action_payload(message: dict) -> Path | None:
+    """Park the whole message where a handler can read it, and hand out only
+    the path. 0600, because a push body carries whatever the sender put in it
+    -- a customer's name and email, in the case this was built for."""
+    try:
+        directory = action_payload_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        normalized = normalized_message(message)
+        name = re.sub(r"[^0-9A-Za-z]", "", normalized["idStr"])[:32] or "unknown"
+        path = directory / f"action-{name}.json"
+        tmp = directory / f"action-{name}.tmp"
+        tmp.touch(mode=0o600)
+        tmp.write_text(json.dumps(normalized, indent=2))
+        os.replace(tmp, path)
+        return path
+    except OSError as error:
+        log(f"could not stage the action payload: {redact(error)}")
+        return None
+
+
+def run_action(message: dict, key: str) -> int:
+    """Run a handler action, giving its command ONE argument: a file path.
+
+    Nothing from the message is interpolated into the argv and no shell is
+    involved. A push title carries whatever the sender chose to put in it --
+    quotes, a newline, a $(...) -- and building a command line out of that is
+    how a notification becomes a local exploit. The command reads the JSON
+    itself and decides what any of it means."""
+    actions = handler_actions(handler_for(message))
+    action = next((a for a in actions if a["key"] == key), None)
+    if action is None:
+        log(f"no action '{key}' is configured for {message.get('app') or 'this sender'}")
+        return 1
+
+    payload = write_action_payload(message)
+    if payload is None:
+        return 1
+
+    try:
+        subprocess.Popen(
+            action["run"] + [str(payload)],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        log(f"could not run {action['run'][0]}: {redact(error)}")
+        return 1
+    log(f"ran '{action['label']}' for {message.get('app') or 'a message'}")
+    return 0
+
+
+def normalized_message(message: dict) -> dict:
+    """The one shape a message has once it is ours.
+
+    Both the panel's history and an action handler's payload are built here, so
+    a handler reads the same field names the bar widget does -- and reads them
+    from one place, rather than from the raw API body in one path and the
+    rewritten history in the other."""
+    return {
+        "id": coerce_int(message.get("id")),
+        # Pushover ids are 19 digits, past JavaScript's safe-integer
+        # range, so the widget compares these strings and never the
+        # number -- JSON.parse would silently round the number.
+        "idStr": str(message.get("idStr") or message.get("id_str") or message.get("id") or ""),
+        "title": str(message.get("title") or message.get("app") or "Pushover"),
+        "message": strip_html(str(message.get("message") or ""))
+        if message.get("html") else str(message.get("message") or ""),
+        "app": str(message.get("app") or "Pushover"),
+        "date": coerce_int(message.get("date")),
+        "priority": coerce_int(message.get("priority")),
+        "url": str(message.get("url") or ""),
+        "urlTitle": str(message.get("urlTitle") or message.get("url_title") or ""),
+        "receipt": str(message.get("receipt") or ""),
+        "acked": bool(message.get("acked")),
+    }
+
+
 def notification_argv(message: dict, icon: str | None, native: bool) -> list[str]:
     app = str(message.get("app") or "Pushover")
     title = str(message.get("title") or app)
@@ -607,6 +784,15 @@ def notification_argv(message: dict, icon: str | None, native: bool) -> list[str
     # A click opens the message's own URL. Omarchy carries this as data rather
     # than a libnotify action, so it still works on a toast restored after a
     # shell restart.
+    #
+    # The payload is staged HERE rather than looked up when the click lands,
+    # because notify() runs before the history is written: a click on a toast
+    # that has only just appeared would find no message to act on.
+    toast = toast_action(message)
+    if toast is not None:
+        payload = write_action_payload(message)
+        if payload is not None:
+            return argv + ["--exec", pullover_binary(), "action", toast["key"], "--payload", str(payload)]
     if url and url_is_openable(url):
         argv += ["--exec", "xdg-open", url]
     return argv
@@ -678,23 +864,7 @@ class Status:
 
     def record(self, messages: list[dict]) -> None:
         for message in messages:
-            self.messages.append({
-                "id": coerce_int(message.get("id")),
-                # Pushover ids are 19 digits, past JavaScript's safe-integer
-                # range, so the widget compares these strings and never the
-                # number -- JSON.parse would silently round the number.
-                "idStr": str(message.get("id_str") or message.get("id") or ""),
-                "title": str(message.get("title") or message.get("app") or "Pushover"),
-                "message": strip_html(str(message.get("message") or ""))
-                if message.get("html") else str(message.get("message") or ""),
-                "app": str(message.get("app") or "Pushover"),
-                "date": coerce_int(message.get("date")),
-                "priority": coerce_int(message.get("priority")),
-                "url": str(message.get("url") or ""),
-                "urlTitle": str(message.get("url_title") or ""),
-                "receipt": str(message.get("receipt") or ""),
-                "acked": bool(message.get("acked")),
-            })
+            self.messages.append(normalized_message(message))
         # Newest first, and only a window of them: this file is read by the bar
         # on every change, so it stays small on purpose.
         # Deduplicated by id: a failed update_highest_message re-delivers the
@@ -1055,6 +1225,69 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def message_from_history(id_str: str) -> dict | None:
+    try:
+        data = json.loads(STATUS_PATH.read_text())
+    except (OSError, ValueError):
+        return None
+    for message in data.get("messages") or []:
+        if str(message.get("idStr") or "") == id_str:
+            return message
+    return None
+
+
+def cmd_action(args: argparse.Namespace) -> int:
+    """Run a configured action against one message.
+
+    Two ways in, because the two callers know different things. The panel has
+    an id and the history on disk; a toast was built before that history was
+    written, so it carries the path it was handed at the time."""
+    if args.payload:
+        try:
+            message = json.loads(Path(args.payload).read_text())
+        except (OSError, ValueError) as error:
+            sys.exit(f"pullover: could not read that payload: {redact(error)}")
+        if not isinstance(message, dict):
+            sys.exit("pullover: that payload is not a message")
+    else:
+        message = message_from_history(args.id or "")
+        if message is None:
+            sys.exit(f"pullover: no message {args.id} in the history")
+    return run_action(message, str(args.key).strip().casefold())
+
+
+def cmd_handlers(args: argparse.Namespace) -> int:
+    """What is configured, and -- with an id -- what it resolves to for one
+    message. The panel keys off the same file; this is how you check that a
+    handler matches before wondering why no key does anything."""
+    if args.id:
+        message = message_from_history(args.id)
+        if message is None:
+            sys.exit(f"pullover: no message {args.id} in the history")
+        handler = handler_for(message)
+        print(json.dumps({
+            "app": message.get("app"),
+            "handler": (handler or {}).get("name") or None,
+            "toast": (toast_action(message) or {}).get("key"),
+            "actions": handler_actions(handler),
+        }, indent=2))
+        return 0
+    print(json.dumps({
+        "path": str(HANDLERS_PATH),
+        "exists": HANDLERS_PATH.exists(),
+        "handlers": [
+            {
+                "name": h.get("name"),
+                "match": h.get("match"),
+                "toast": h.get("toast"),
+                "actions": handler_actions(h),
+            }
+            for h in load_handlers()
+        ],
+    }, indent=2))
+    return 0
+
+
 def cmd_selftest(args: argparse.Namespace) -> int:
     """Prove the notification path works without waiting for a real push."""
     notify({
@@ -1105,6 +1338,17 @@ def main() -> int:
 
     status = sub.add_parser("status", help="print the state file the bar widget reads")
     status.set_defaults(func=cmd_status)
+
+    action = sub.add_parser("action", help="run a configured handler action on a message")
+    action.add_argument("key", help="the action's single-character key")
+    source = action.add_mutually_exclusive_group(required=True)
+    source.add_argument("--id", help="a message id from the history (what the panel passes)")
+    source.add_argument("--payload", help="a staged message file (what a toast passes)")
+    action.set_defaults(func=cmd_action)
+
+    handlers = sub.add_parser("handlers", help="show the configured handlers, or what one message resolves to")
+    handlers.add_argument("--id", help="resolve against this message from the history")
+    handlers.set_defaults(func=cmd_handlers)
 
     selftest = sub.add_parser("selftest", help="show a local test notification")
     selftest.set_defaults(func=cmd_selftest)
