@@ -142,3 +142,12 @@ test("an empty message list prunes nothing, because the daemon restarts", () => 
   assert.deepEqual(Model.prunedDismissed([], ["a", "b"]), ["a", "b"]);
   assert.deepEqual(Model.prunedDismissed(null, ["a"]), ["a"]);
 });
+
+test("clearing keeps earlier dismissals rather than replacing them", () => {
+  // What `dismissAll` now builds: the union, then pruned to the live window.
+  const messages = [{ idStr: "b" }, { idStr: "a" }];
+  const union = ["older-and-aged-out", "a", "b"];
+  assert.deepEqual(Model.prunedDismissed(messages, union), ["a", "b"]);
+  // And with no history at all, nothing is discarded.
+  assert.deepEqual(Model.prunedDismissed([], union), union);
+});

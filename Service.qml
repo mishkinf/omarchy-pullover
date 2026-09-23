@@ -106,9 +106,16 @@ Item {
   }
 
   function dismissAll() {
-    var next = []
-    for (var i = 0; i < messages.length; i++) next.push(messages[i].idStr)
-    _writeDismissed(next)
+    // Adds to what is already dismissed rather than replacing it. Writing only
+    // the ids currently on screen dropped every earlier dismissal -- and wrote
+    // an empty list outright if the daemon happened to be restarting, which is
+    // the same defect `dismiss` had.
+    if (messages.length === 0) return
+    var next = dismissedIds.slice()
+    for (var i = 0; i < messages.length; i++) {
+      if (!Model.isDismissed(messages[i].idStr, next)) next.push(messages[i].idStr)
+    }
+    _writeDismissed(Model.prunedDismissed(messages, next))
   }
 
   function _writeDismissed(list) {
