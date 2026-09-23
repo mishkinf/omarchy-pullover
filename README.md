@@ -196,7 +196,7 @@ somewhere a plugin can quietly behave badly:
 ./test
 ```
 
-79 tests — 61 Python, 18 Node — needing no network and no Pushover account.
+80 tests — 61 Python, 19 Node — needing no network and no Pushover account.
 They write only into a temp directory. The Node half is skipped if Node is not
 installed.
 
@@ -242,6 +242,10 @@ Each of these is a bug that actually happened here.
 - **A binding read per row is read after the handler that zeroed it.** Marking
   everything read on open made the unread emphasis permanently unreachable; the
   count has to be captured before.
+- **Never prune persisted user intent against transient state.** Dismissals
+  were pruned to "ids the daemon still holds", and the daemon's history is
+  empty for a moment on every restart — so a dismissal made in that window
+  erased every earlier one too.
 - **Gate a value in every place it is used, not in the cleverest one.** The
   daemon refused non-http schemes before handing a push URL to `xdg-open`; the
   widget handed the same value to the same program ungated.

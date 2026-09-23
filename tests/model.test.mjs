@@ -135,3 +135,10 @@ test("the id-string fallback covers a file written before idStr existed", () => 
   const out = Model.normalizeMessages([{ id: "1182737485987742185", title: "t" }]);
   assert.equal(out[0].idStr, "1182737485987742185");
 });
+
+test("an empty message list prunes nothing, because the daemon restarts", () => {
+  // Pruning against a transiently empty history would discard every dismissal
+  // the user has made, including the one being written in the same call.
+  assert.deepEqual(Model.prunedDismissed([], ["a", "b"]), ["a", "b"]);
+  assert.deepEqual(Model.prunedDismissed(null, ["a"]), ["a"]);
+});

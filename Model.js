@@ -147,8 +147,13 @@ function liveMessages(messages, dismissed) {
 
 // Written back after every change so the file cannot grow without bound as
 // messages age out of the daemon's window.
+//
+// An EMPTY message list prunes nothing. The daemon's history is briefly empty
+// while it restarts, and pruning against it would throw away every dismissal
+// the user has ever made -- including the one being added in the same call.
 function prunedDismissed(messages, dismissed) {
   if (!dismissed) return []
+  if (!messages || messages.length === 0) return dismissed.slice()
   var known = {}
   for (var i = 0; i < messages.length; i++) known[messages[i].idStr] = true
   var out = []
