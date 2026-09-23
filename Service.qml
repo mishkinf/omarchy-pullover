@@ -20,6 +20,16 @@ Item {
   property int lastSeenId: 0
   property string actionStatus: ""
 
+  // Sign-in state. The daemon cannot report this -- it is not running until
+  // there is a login -- so it is probed from the credentials file instead.
+  property bool probed: false
+  property bool loggedIn: false
+  property bool serviceActive: false
+  property bool serviceEnabled: false
+  property bool signingIn: false
+  property bool needsTwofa: false
+  property string loginError: ""
+
   readonly property string stateHome: (Quickshell.env("XDG_STATE_HOME")
     || Quickshell.env("HOME") + "/.local/state") + "/pushover"
   readonly property string statePath: stateHome + "/status.json"
@@ -33,6 +43,41 @@ Item {
   function refresh() {
     stateFile.reload()
     lastSeenFile.reload()
+    probe()
+  }
+
+  function probe() {
+    if (probeProcess.running) return
+    probeProcess.running = true
+  }
+
+  // The password goes over stdin, never argv: anything in argv is readable by
+  // every other process on this machine.
+  function signIn(email, password, twofa, deviceName) {
+    if (signingIn) return
+    loginError = ""
+    signingIn = true
+    loginProcess.request = JSON.stringify({
+      email: String(email || ""),
+      password: String(password || ""),
+      twofa: String(twofa || ""),
+      deviceName: String(deviceName || "omarchy")
+    })
+    loginProcess.running = true
+  }
+
+  function startService() {
+    if (serviceProcess.running) return
+    actionStatus = "Starting…"
+    serviceProcess.command = ["pushover-open-client", "service", "enable"]
+    serviceProcess.running = true
+  }
+
+  function signOut() {
+    if (serviceProcess.running) return
+    actionStatus = "Signing out…"
+    serviceProcess.command = ["pushover-open-client", "logout"]
+    serviceProcess.running = true
   }
 
   function markAllRead() {
@@ -111,6 +156,70 @@ Item {
 
   Process { id: markReadProcess }
   Process { id: openProcess }
+
+  Process {
+    id: probeProcess
+    command: ["pushover-open-client", "probe"]
+    stdout: StdioCollector { id: probeOut; waitForEnd: true }
+    onExited: function (exitCode) {
+      root.probed = true
+      if (exitCode !== 0) return
+      try {
+        var data = JSON.parse(String(probeOut.text || "{}"))
+        root.loggedIn = data.loggedIn === true
+        if (data.deviceName) root.deviceName = String(data.deviceName)
+        root.serviceActive = data.service && data.service.active === true
+        root.serviceEnabled = data.service && data.service.enabled === true
+      } catch (error) {
+        // A probe we cannot parse says nothing; it must not read as a logout.
+      }
+    }
+  }
+
+  Process {
+    id: loginProcess
+    property string request: ""
+    command: ["pushover-open-client", "login", "--stdin"]
+    stdinEnabled: true
+    stdout: StdioCollector { id: loginOut; waitForEnd: true }
+    onStarted: {
+      // The newline is what ends the request; the CLI reads one line rather
+      // than to EOF, so this cannot depend on the pipe being closed for us.
+      write(request + "\n")
+      request = ""
+      stdinEnabled = false
+    }
+    onExited: function (exitCode) {
+      root.signingIn = false
+      var result = {}
+      try {
+        result = JSON.parse(String(loginOut.text || "{}"))
+      } catch (error) {
+        root.loginError = "The login command returned something unreadable."
+        return
+      }
+      root.needsTwofa = result.needsTwofa === true
+      if (result.ok === true) {
+        root.loginError = ""
+        root.loggedIn = true
+        if (result.deviceName) root.deviceName = String(result.deviceName)
+        // Signing in and then not receiving anything would be a strange
+        // success, so the client is started as part of it.
+        root.startService()
+      } else {
+        root.loginError = String(result.error || "Login failed")
+      }
+    }
+  }
+
+  Process {
+    id: serviceProcess
+    onExited: function (exitCode) {
+      root.actionStatus = exitCode === 0 ? "" : "Could not start the client"
+      if (exitCode !== 0) statusClear.restart()
+      root.probe()
+    }
+  }
 
   Process {
     id: ackProcess

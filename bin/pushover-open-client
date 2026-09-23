@@ -85,7 +85,7 @@ def load_credentials() -> dict:
     if not CREDENTIALS_PATH.exists():
         sys.exit(
             "pushover-open-client: not logged in.\n"
-            "  Run: pushover-open-client login"
+            "  Run: pushover-open-client login (or use the bar widget)"
         )
     with CREDENTIALS_PATH.open() as handle:
         creds = json.load(handle)
@@ -123,59 +123,174 @@ def api_get(path: str, params: dict) -> requests.Response:
     )
 
 
-def cmd_login(args: argparse.Namespace) -> int:
-    if CREDENTIALS_PATH.exists() and not args.force:
-        sys.exit(f"pushover-open-client: already logged in ({CREDENTIALS_PATH}). Pass --force to replace.")
+SERVICE = "pushover-open-client.service"
 
-    email = args.email or input("Pushover email: ").strip()
-    password = getpass.getpass("Pushover password: ")
+
+def perform_login(email: str, password: str, twofa: str, device_name: str, force: bool) -> dict:
+    """The whole login, as data in and data out.
+
+    Both front ends go through here -- the terminal prompts and the bar
+    widget's form -- so neither can drift into a different login."""
+    if CREDENTIALS_PATH.exists() and not force:
+        return {"ok": False, "error": "Already logged in. Sign out first to replace it."}
+
+    # Pushover's own constraint, checked here so the failure is readable
+    # rather than a 400 from the API.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,25}", device_name or ""):
+        return {"ok": False, "error": "Device name must be 1-25 letters, digits, _ or -"}
+    if not email or not password:
+        return {"ok": False, "error": "Email and password are both required"}
 
     payload = {"email": email, "password": password}
-    response = api_post("users/login.json", payload)
+    if twofa:
+        payload["twofa"] = twofa
 
-    # 412 is Pushover's "this account has two-factor on"; the same call is
-    # repeated with the code rather than a different endpoint.
-    if response.status_code == 412:
-        payload["twofa"] = input("Two-factor code: ").strip()
+    try:
         response = api_post("users/login.json", payload)
+    except requests.RequestException as error:
+        return {"ok": False, "error": f"Could not reach Pushover: {error}"}
 
-    if response.status_code == 401:
-        sys.exit("pushover-open-client: login rejected. Check the email and password.")
+    # 412 is "this account has two-factor on". It is not a failure, it is a
+    # request for one more field, so it gets its own flag rather than an error.
+    if response.status_code == 412:
+        return {"ok": False, "needsTwofa": True, "error": "Two-factor code required"}
+    # The docs say 401 for a bad login; the API actually answers 403 (measured
+    # 2026-09-22 against a wrong password). Both are the same thing to a user.
+    if response.status_code in (401, 403):
+        return {"ok": False, "error": "Pushover rejected that email and password"}
     if not response.ok:
-        sys.exit(f"pushover-open-client: login failed (HTTP {response.status_code}): {response.text[:200]}")
+        return {"ok": False, "error": f"Login failed (HTTP {response.status_code})"}
 
-    body = response.json()
-    secret = body.get("secret")
+    secret = response.json().get("secret")
     if not secret:
-        sys.exit(f"pushover-open-client: login response had no secret: {body}")
+        return {"ok": False, "error": "Login succeeded but returned no secret"}
 
-    device_name = args.device_name
-    # Pushover's own constraint, enforced here so the failure is readable
-    # rather than a 400 from the API.
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,25}", device_name):
-        sys.exit("pushover-open-client: device name must be 1-25 chars of letters, digits, _ or -")
+    try:
+        response = api_post("devices.json", {"secret": secret, "name": device_name, "os": "O"})
+    except requests.RequestException as error:
+        return {"ok": False, "error": f"Could not register the device: {error}"}
 
-    response = api_post("devices.json", {"secret": secret, "name": device_name, "os": "O"})
     if response.status_code == 400:
-        sys.exit(
-            f"pushover-open-client: could not register device '{device_name}': {response.text[:300]}\n"
-            "  A name already in use, or the 10-device account limit, both land here.\n"
-            "  Pick another with --device-name, or retire a device at https://pushover.net/devices"
-        )
+        # A name already in use and the 10-device account limit both land here,
+        # and the API's own wording is more specific than anything we'd invent.
+        detail = ""
+        try:
+            errors = response.json().get("errors") or []
+            detail = "; ".join(str(e) for e in errors)
+        except ValueError:
+            pass
+        return {"ok": False, "error": detail or f"Device '{device_name}' was rejected"}
     if not response.ok:
-        sys.exit(f"pushover-open-client: device registration failed (HTTP {response.status_code}): {response.text[:200]}")
+        return {"ok": False, "error": f"Device registration failed (HTTP {response.status_code})"}
 
     device_id = response.json().get("id")
     if not device_id:
-        sys.exit(f"pushover-open-client: device response had no id: {response.text[:200]}")
+        return {"ok": False, "error": "Device registration returned no id"}
 
     save_credentials({"secret": secret, "device_id": device_id, "device_name": device_name})
+    return {"ok": True, "deviceName": device_name}
 
-    print(f"\nRegistered this machine with Pushover as '{device_name}'.")
+
+def systemctl(verb: str) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", verb, SERVICE],
+            capture_output=True, text=True, timeout=20,
+        )
+        return result.returncode == 0, (result.stdout + result.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)
+
+
+def service_state() -> dict:
+    active, active_out = systemctl("is-active")
+    enabled, enabled_out = systemctl("is-enabled")
+    # is-active exits non-zero for an inactive unit, so the word is the answer
+    # and the exit code is not.
+    return {
+        "active": active_out == "active",
+        "enabled": enabled_out in ("enabled", "enabled-runtime"),
+    }
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    if args.stdin:
+        # The password arrives over stdin, never argv: anything in argv is
+        # readable by every process on the machine.
+        #
+        # One LINE, not read-to-EOF. A caller that writes the request but does
+        # not close the pipe would hang here forever, and the bar widget is
+        # exactly such a caller.
+        try:
+            request = json.loads(sys.stdin.readline() or "{}")
+        except ValueError as error:
+            print(json.dumps({"ok": False, "error": f"Could not read the request: {error}"}))
+            return 1
+        result = perform_login(
+            str(request.get("email") or "").strip(),
+            str(request.get("password") or ""),
+            str(request.get("twofa") or "").strip(),
+            str(request.get("deviceName") or args.device_name),
+            bool(request.get("force") or args.force),
+        )
+        print(json.dumps(result))
+        return 0 if result.get("ok") else 1
+
+    email = args.email or input("Pushover email: ").strip()
+    password = getpass.getpass("Pushover password: ")
+    result = perform_login(email, password, "", args.device_name, args.force)
+
+    if result.get("needsTwofa"):
+        twofa = input("Two-factor code: ").strip()
+        result = perform_login(email, password, twofa, args.device_name, args.force)
+
+    if not result.get("ok"):
+        sys.exit(f"pushover-open-client: {result.get('error')}")
+
+    print(f"\nRegistered this machine with Pushover as '{result['deviceName']}'.")
     print(f"Credentials: {CREDENTIALS_PATH} (mode 600)")
     print("\nPushover for Desktop is free for 30 days; after that it is a one-time $4.99")
     print("licence on your account: https://pushover.net/clients/desktop")
-    print("\nStart receiving:  systemctl --user enable --now pushover-open-client.service")
+    print(f"\nStart receiving:  systemctl --user enable --now {SERVICE}")
+    return 0
+
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    """What the bar widget asks before deciding which screen to show."""
+    logged_in = CREDENTIALS_PATH.exists()
+    device_name = ""
+    if logged_in:
+        try:
+            with CREDENTIALS_PATH.open() as handle:
+                device_name = str(json.load(handle).get("device_name") or "")
+        except (OSError, ValueError):
+            # A credentials file we cannot read is not a login.
+            logged_in = False
+    print(json.dumps({
+        "loggedIn": logged_in,
+        "deviceName": device_name,
+        "service": service_state(),
+    }))
+    return 0
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    verbs = {"enable": ["enable", "restart"], "restart": ["restart"], "stop": ["stop"]}[args.verb]
+    for verb in verbs:
+        ok, output = systemctl(verb)
+        if not ok:
+            print(json.dumps({"ok": False, "error": output or f"systemctl {verb} failed"}))
+            return 1
+    print(json.dumps({"ok": True, "service": service_state()}))
+    return 0
+
+
+def cmd_logout(args: argparse.Namespace) -> int:
+    systemctl("disable")
+    systemctl("stop")
+    CREDENTIALS_PATH.unlink(missing_ok=True)
+    STATUS_PATH.unlink(missing_ok=True)
+    print(json.dumps({"ok": True}))
     return 0
 
 
@@ -486,7 +601,19 @@ def main() -> int:
     login.add_argument("--email", help="skip the email prompt")
     login.add_argument("--device-name", default="omarchy", help="device name shown in Pushover (default: omarchy)")
     login.add_argument("--force", action="store_true", help="replace existing credentials")
+    login.add_argument("--stdin", action="store_true",
+                       help="read {email, password, twofa} as JSON on stdin and answer with JSON")
     login.set_defaults(func=cmd_login)
+
+    probe = sub.add_parser("probe", help="JSON: whether this machine is logged in and running")
+    probe.set_defaults(func=cmd_probe)
+
+    service = sub.add_parser("service", help="enable, restart or stop the background client")
+    service.add_argument("verb", choices=["enable", "restart", "stop"])
+    service.set_defaults(func=cmd_service)
+
+    logout = sub.add_parser("logout", help="stop the client and forget the credentials")
+    logout.set_defaults(func=cmd_logout)
 
     run = sub.add_parser("run", help="hold the websocket and show notifications")
     run.set_defaults(func=cmd_run)

@@ -47,13 +47,21 @@ Panel {
     // Opening the panel is the act of reading, so the badge clears here and
     // not on arrival.
     pushover.markAllRead()
-    Qt.callLater(function () { keyCatcher.forceActiveFocus() })
+    Qt.callLater(function () {
+      if (pushover.probed && !pushover.loggedIn) emailField.forceActiveFocus()
+      else keyCatcher.forceActiveFocus()
+    })
   }
 
   function moveCursor(dy) {
     cursorActive = true
     if (visibleMessages.length === 0) return
     cursorIndex = Math.max(0, Math.min(visibleMessages.length - 1, cursorIndex + dy))
+  }
+
+  function submitSignIn() {
+    if (emailField.text === "" || passwordField.text === "") return
+    pushover.signIn(emailField.text, passwordField.text, twofaField.text, "omarchy")
   }
 
   function currentMessage() {
@@ -140,6 +148,9 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // Documented contract of PanelKeyCatcher: a panel with an inline editor
+      // must block it, or "j" scrolls the list instead of typing a letter.
+      blocked: emailField.activeFocus || passwordField.activeFocus || twofaField.activeFocus
       onMoveRequested: function (dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
@@ -178,9 +189,10 @@ Panel {
           PanelHero {
             width: parent.width
             title: "Pushover"
-            meta: !pushover.daemonRunning ? "Daemon is not running"
+            meta: !pushover.loggedIn && pushover.probed ? "Not signed in"
               : pushover.schemaUnsupported ? "Unsupported status schema"
               : pushover.connected ? (pushover.deviceName !== "" ? "Connected as " + pushover.deviceName : "Connected")
+              : !pushover.daemonRunning ? "Client is stopped"
               : "Reconnecting…"
             foreground: root.foreground
             fontFamily: root.fontFamily
@@ -223,6 +235,120 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          // Signing in lives here rather than in a terminal: a plugin that
+          // needs a CLI before it works has not handled authentication.
+          Column {
+            id: signInForm
+            visible: pushover.probed && !pushover.loggedIn
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "SIGN IN"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: "Your Pushover account. The password is exchanged for a device token and never stored."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            TextField {
+              id: emailField
+              width: parent.width
+              placeholderText: "Email"
+              foreground: root.foreground
+              enabled: !pushover.signingIn
+              onAccepted: passwordField.forceActiveFocus()
+            }
+
+            TextField {
+              id: passwordField
+              width: parent.width
+              placeholderText: "Password"
+              password: true
+              foreground: root.foreground
+              enabled: !pushover.signingIn
+              onAccepted: root.submitSignIn()
+            }
+
+            TextField {
+              id: twofaField
+              width: parent.width
+              // Revealed only once the server has asked for it, so an account
+              // without two-factor never sees a field it cannot fill.
+              visible: pushover.needsTwofa
+              placeholderText: "Two-factor code"
+              foreground: root.foreground
+              enabled: !pushover.signingIn
+              onAccepted: root.submitSignIn()
+              onVisibleChanged: if (visible) Qt.callLater(forceActiveFocus)
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              visible: pushover.loginError !== ""
+              width: parent.width
+              text: pushover.loginError
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            Button {
+              width: parent.width
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              text: pushover.signingIn ? "Signing in…" : "Sign in"
+              enabled: !pushover.signingIn && emailField.text !== "" && passwordField.text !== ""
+              onClicked: root.submitSignIn()
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: "Pushover for Desktop is free for 30 days, then a one-time $4.99 licence on your account."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          // Signed in, but nothing is holding the socket.
+          Column {
+            visible: pushover.loggedIn && !pushover.serviceActive && pushover.probed
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: "Signed in as " + (pushover.deviceName || "this machine") + ", but the client is not running, so nothing is arriving."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            Button {
+              width: parent.width
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              text: "Start receiving"
+              onClicked: pushover.startService()
+            }
+          }
+
           Column {
             visible: pushover.hasMessages
             width: parent.width
@@ -253,11 +379,9 @@ Panel {
 
           Text {
             textFormat: Text.PlainText
-            visible: !pushover.hasMessages
+            visible: !pushover.hasMessages && pushover.loggedIn && pushover.serviceActive
             width: parent.width
-            text: !pushover.daemonRunning
-              ? "Start the client:\nsystemctl --user enable --now pushover-open-client.service"
-              : "No pushes yet. Anything sent to your Pushover account will arrive here."
+            text: "No pushes yet. Anything sent to your Pushover account will arrive here."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body

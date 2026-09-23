@@ -29,14 +29,25 @@ The daemon is useful on its own; the widget is not useful without it.
 ```bash
 omarchy plugin add https://github.com/mishkinf/omarchy-pushover.git --enable
 cd ~/.config/omarchy/plugins/io.github.mishkinf.pushover && ./setup
-pushover-open-client login
-systemctl --user enable --now pushover-open-client.service
 ```
 
-`login` asks for your Pushover email and password (and a 2FA code if the
-account has it), exchanges them for a session secret, and registers this
-machine as a device. The password is never stored. The secret lands in
+Then **click the bell and sign in there**. The panel asks for your Pushover
+email and password, reveals a two-factor field only if the server asks for one,
+registers this machine as a device, and starts the client on success. There is
+no terminal step.
+
+The password is never stored and never passed as an argument — it goes to the
+CLI over stdin, because anything in argv is readable by every process on the
+machine. What is kept is the device token, in
 `~/.config/pushover/credentials.json`, mode 600.
+
+The same thing from a terminal, if you prefer:
+
+```bash
+pushover-open-client login
+pushover-open-client probe     # JSON: signed in? client running?
+pushover-open-client logout    # stop the client and forget the token
+```
 
 **Pushover for Desktop is free for 30 days, then a one-time $4.99 licence** on
 your account — a phone or Mac licence does not cover it. An Open Client device
