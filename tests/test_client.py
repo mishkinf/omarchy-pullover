@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -111,39 +112,87 @@ class StatusFile(unittest.TestCase):
         self.status.clear()
 
 
-class Notify(unittest.TestCase):
+class BodyMarkup(unittest.TestCase):
+    def test_a_plain_body_is_escaped_because_omarchy_renders_StyledText(self):
+        body = client.body_for_notification({"message": "5 < 6 & rising"})
+        self.assertEqual(body, "5 &lt; 6 &amp; rising")
+
+    def test_an_html_body_is_passed_through_for_the_renderer(self):
+        body = client.body_for_notification({"message": "<b>Sold</b>", "html": 1})
+        self.assertEqual(body, "<b>Sold</b>")
+
+
+class DndBypass(unittest.TestCase):
+    def test_only_high_and_emergency_bypass(self):
+        self.assertFalse(client.bypasses_dnd(-1))
+        self.assertFalse(client.bypasses_dnd(0))
+        self.assertTrue(client.bypasses_dnd(1))
+        self.assertTrue(client.bypasses_dnd(2))
+
+
+class NativeNotification(unittest.TestCase):
     def _argv(self, message):
-        with mock.patch.object(client.shutil, "which", return_value="/usr/bin/notify-send"), \
-             mock.patch.object(client, "icon_path", return_value=None), \
-             mock.patch.object(client.subprocess, "run") as run:
-            client.notify(message)
-        return run.call_args[0][0]
+        return client.notification_argv(message, None, native=True)
 
-    def test_carries_title_body_app_and_urgency(self):
-        argv = self._argv({"title": "Ridekick", "message": "hi", "app": "Ridekick Admin", "priority": 1})
-        self.assertIn("--app-name", argv)
-        self.assertEqual(argv[argv.index("--app-name") + 1], "Ridekick Admin")
-        self.assertEqual(argv[argv.index("--urgency") + 1], "critical")
-        self.assertEqual(argv[-2:], ["Ridekick", "hi"])
+    def test_a_normal_push_keeps_its_app_name(self):
+        argv = self._argv({"title": "t", "message": "m", "app": "Ridekick", "priority": 0})
+        self.assertEqual(argv[argv.index("--app-name") + 1], "Ridekick")
 
-    def test_emergency_pushes_do_not_expire(self):
+    def test_a_high_priority_push_drops_the_app_name_to_clear_DND(self):
+        # Omarchy grants the bypass to 'omarchy-action' only, which is the
+        # sender's default, so the app name has to go.
+        argv = self._argv({"title": "Alert", "message": "m", "app": "Ridekick", "priority": 1})
+        self.assertNotIn("--app-name", argv)
+
+    def test_the_sender_moves_into_the_headline_when_it_is_dropped(self):
+        argv = self._argv({"title": "Alert", "message": "m", "app": "Ridekick", "priority": 1})
+        self.assertIn("Ridekick: Alert", argv)
+
+    def test_the_headline_is_not_doubled_when_it_already_names_the_sender(self):
+        argv = self._argv({"title": "Ridekick down", "message": "m", "app": "Ridekick", "priority": 1})
+        self.assertIn("Ridekick down", argv)
+        self.assertNotIn("Ridekick: Ridekick down", argv)
+
+    def test_a_url_becomes_a_click_action_rather_than_body_text(self):
+        argv = self._argv({"title": "t", "message": "m", "priority": 0, "url": "https://example.com"})
+        self.assertEqual(argv[-3:], ["--exec", "xdg-open", "https://example.com"])
+        self.assertNotIn("https://example.com", argv[argv.index("m")])
+
+    def test_an_emergency_push_does_not_expire(self):
         argv = self._argv({"title": "t", "message": "m", "priority": 2})
         self.assertEqual(argv[argv.index("--expire-time") + 1], "0")
 
-    def test_ordinary_pushes_keep_the_default_timeout(self):
-        argv = self._argv({"title": "t", "message": "m", "priority": 0})
-        self.assertNotIn("--expire-time", argv)
 
-    def test_the_url_is_appended_to_the_body(self):
+class FallbackNotification(unittest.TestCase):
+    def _argv(self, message):
+        return client.notification_argv(message, None, native=False)
+
+    def test_falls_back_to_notify_send(self):
+        argv = self._argv({"title": "t", "message": "m", "app": "A", "priority": 0})
+        self.assertEqual(argv[0], "notify-send")
+        self.assertEqual(argv[-2:], ["t", "m"])
+
+    def test_the_url_is_appended_to_the_body_when_there_is_no_click_action(self):
         argv = self._argv({
             "title": "t", "message": "m", "priority": 0,
             "url": "https://example.com", "url_title": "Open admin",
         })
         self.assertEqual(argv[-1], "m\nOpen admin")
 
-    def test_missing_notify_send_does_not_raise(self):
+
+class NotifyDispatch(unittest.TestCase):
+    def test_missing_both_senders_does_not_raise(self):
         with mock.patch.object(client.shutil, "which", return_value=None):
             client.notify({"title": "t", "message": "m"})
+
+    def test_the_native_sender_is_preferred(self):
+        def which(name):
+            return "/usr/bin/" + name
+        with mock.patch.object(client.shutil, "which", side_effect=which), \
+             mock.patch.object(client, "icon_path", return_value=None), \
+             mock.patch.object(client.subprocess, "run") as run:
+            client.notify({"title": "t", "message": "m", "priority": 0})
+        self.assertEqual(run.call_args[0][0][0], "omarchy-notification-send")
 
 
 class Login(unittest.TestCase):
@@ -253,3 +302,58 @@ class StatusHistorySurvivesRestart(unittest.TestCase):
         status = client.Status()
         status.load()
         self.assertEqual(status.messages[0]["idStr"], "1182737485987742200")
+
+
+class Trial(unittest.TestCase):
+    def setUp(self):
+        client.CREDENTIALS_PATH.unlink(missing_ok=True)
+        client.TRIAL_WARNED_PATH.unlink(missing_ok=True)
+
+    def test_unknown_when_not_signed_in(self):
+        self.assertFalse(client.trial_state()["known"])
+
+    def test_counts_down_from_the_registration_date(self):
+        client.save_credentials({
+            "secret": "s", "device_id": "d", "device_name": "n",
+            "registered_at": int(time.time()) - 25 * 86400,
+        })
+        self.assertEqual(client.trial_state()["daysRemaining"], 5)
+
+    def test_never_goes_negative(self):
+        client.save_credentials({
+            "secret": "s", "device_id": "d", "device_name": "n",
+            "registered_at": int(time.time()) - 99 * 86400,
+        })
+        self.assertEqual(client.trial_state()["daysRemaining"], 0)
+
+    def test_falls_back_to_the_credentials_mtime_for_an_older_install(self):
+        # Written before registered_at existed.
+        client.save_credentials({"secret": "s", "device_id": "d", "device_name": "n"})
+        state = client.trial_state()
+        self.assertTrue(state["known"])
+        self.assertEqual(state["daysRemaining"], client.TRIAL_DAYS)
+
+    def test_a_licensed_device_is_not_warned(self):
+        client.save_credentials({
+            "secret": "s", "device_id": "d", "device_name": "n",
+            "registered_at": int(time.time()) - 29 * 86400, "licensed": True,
+        })
+        with mock.patch.object(client, "notify") as notify:
+            c = client.Client({"secret": "s", "device_id": "d"})
+            c.maybe_warn_about_trial()
+        notify.assert_not_called()
+
+    def test_warns_once_per_threshold_and_not_again(self):
+        client.save_credentials({
+            "secret": "s", "device_id": "d", "device_name": "n",
+            "registered_at": int(time.time()) - 25 * 86400,
+        })
+        with mock.patch.object(client, "notify") as notify:
+            c = client.Client({"secret": "s", "device_id": "d"})
+            c.maybe_warn_about_trial()
+            self.assertEqual(notify.call_count, 1)
+            self.assertIn("5 days", notify.call_args[0][0]["title"])
+            # The hourly gate, and then the recorded threshold, both hold.
+            c._trial_checked_at = 0.0
+            c.maybe_warn_about_trial()
+            self.assertEqual(notify.call_count, 1)

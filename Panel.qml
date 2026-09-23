@@ -32,7 +32,7 @@ Panel {
     ? Qt.darker(barForeground, 1.55)
     : (pushover.connected ? barForeground : root.urgent)
 
-  readonly property var visibleMessages: pushover.messages.slice(0, maxVisible)
+  readonly property var visibleMessages: pushover.liveMessages.slice(0, maxVisible)
 
   visible: !hideWhenIdle || pushover.daemonRunning
   implicitWidth: button.implicitWidth
@@ -170,6 +170,14 @@ Panel {
         } else if (key === "a") {
           var target = root.currentMessage()
           if (target && Model.needsAck(target)) pushover.acknowledge(target.receipt)
+        } else if (key === "d") {
+          var going = root.currentMessage()
+          if (going) {
+            pushover.dismiss(going.idStr)
+            // The list shortens under the cursor, so it has to be pulled back
+            // or it points past the end.
+            root.cursorIndex = Math.max(0, Math.min(root.cursorIndex, root.visibleMessages.length - 2))
+          }
         }
       }
 
@@ -236,6 +244,51 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
+          }
+
+          Column {
+            visible: pushover.trialEndingSoon
+            width: parent.width
+            spacing: Style.space(6)
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: pushover.trialDaysRemaining <= 0
+                ? "The Pushover desktop trial has ended. This device may have stopped receiving."
+                : "Pushover desktop trial ends in " + pushover.trialDaysRemaining
+                  + (pushover.trialDaysRemaining === 1 ? " day." : " days.")
+                  + " After that this device stops receiving."
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Button {
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                text: "Buy the $4.99 licence"
+                onClicked: pushover.openUrl("https://pushover.net/clients/desktop")
+              }
+
+              Button {
+                bordered: true
+                foreground: root.dim
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                // Pushover exposes no way to read licence status, so the only
+                // source for "already paid" is the person who paid.
+                text: "Already bought it"
+                onClicked: pushover.markLicensed()
+              }
+            }
           }
 
           Text {
@@ -379,10 +432,27 @@ Panel {
             width: parent.width
             spacing: Style.space(10)
 
-            PanelSectionHeader {
-              text: "RECENT"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
+            Item {
+              width: parent.width
+              implicitHeight: recentHeader.implicitHeight
+
+              PanelSectionHeader {
+                id: recentHeader
+                anchors.left: parent.left
+                text: "RECENT"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Button {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.dim
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                text: "Clear"
+                onClicked: pushover.dismissAll()
+              }
             }
 
             Column {
@@ -524,7 +594,7 @@ Panel {
         Layout.fillWidth: true
         visible: (messageRow.message.url || "") !== "" || messageRow.emergency
         text: messageRow.emergency
-          ? ((messageRow.message.url || "") !== "" ? "Enter to open · a to acknowledge" : "a to acknowledge")
+          ? ((messageRow.message.url || "") !== "" ? "Enter to open · a to acknowledge · d to dismiss" : "a to acknowledge · d to dismiss")
           : (messageRow.message.urlTitle || messageRow.message.url || "")
         color: messageRow.emergency ? root.urgent : Qt.darker(root.foreground, 2.0)
         font.family: root.fontFamily

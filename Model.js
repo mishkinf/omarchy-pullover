@@ -100,13 +100,44 @@ function relativeTime(epochSeconds, nowSeconds) {
 // rather than an id comparison: a Pushover id is 19 digits, JSON.parse turns it
 // into a double, and two ids that differ only in their final digits round to
 // the same value. Nothing here ever compares two ids as numbers.
-function unreadCount(messages, lastSeenIdStr) {
-  if (!lastSeenIdStr) return messages.length
+function unreadCount(messages, lastSeenIdStr, dismissed) {
+  var count = 0
   for (var i = 0; i < messages.length; i++) {
-    if (messages[i].idStr === lastSeenIdStr) return i
+    // The marker is kept against the FULL list, so dismissing the message that
+    // happens to be the marker does not re-unread everything above it.
+    if (lastSeenIdStr && messages[i].idStr === lastSeenIdStr) return count
+    if (!isDismissed(messages[i].idStr, dismissed)) count++
   }
-  // The marked message has aged out of the window, so everything held is new.
-  return messages.length
+  // The marked message aged out of the window, so everything held is new.
+  return count
+}
+
+function isDismissed(idStr, dismissed) {
+  return !!dismissed && dismissed.indexOf(idStr) >= 0
+}
+
+// Dismissal is the widget's own idea, like unread: the daemon keeps what
+// arrived, and this screen decides what is still worth showing.
+function liveMessages(messages, dismissed) {
+  if (!dismissed || dismissed.length === 0) return messages
+  var out = []
+  for (var i = 0; i < messages.length; i++) {
+    if (!isDismissed(messages[i].idStr, dismissed)) out.push(messages[i])
+  }
+  return out
+}
+
+// Written back after every change so the file cannot grow without bound as
+// messages age out of the daemon's window.
+function prunedDismissed(messages, dismissed) {
+  if (!dismissed) return []
+  var known = {}
+  for (var i = 0; i < messages.length; i++) known[messages[i].idStr] = true
+  var out = []
+  for (var j = 0; j < dismissed.length; j++) {
+    if (known[dismissed[j]]) out.push(dismissed[j])
+  }
+  return out
 }
 
 function newestIdStr(messages) {

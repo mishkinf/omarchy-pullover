@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.mishkinf.pushover",
   "name": "Pushover",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Mishkin Faustini",
   "license": "MIT",
   "description": "Pushover pushes as native desktop notifications, plus a bar widget with unread count and recent-message history. Uses Pushover's Open Client API, so every push that reaches the phone reaches this machine.",

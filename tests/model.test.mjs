@@ -11,8 +11,12 @@ import assert from "node:assert/strict";
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library\s*$/m, "");
+// The export list is derived rather than written out: a hand-kept list silently
+// omits each new function, and the test then fails as "not a function" rather
+// than as the thing it was meant to check.
+const names = [...source.matchAll(/^function\s+([A-Za-z0-9_]+)\s*\(/gm)].map(m => m[1]);
 const Model = {};
-new Function("exports", source + "\n;Object.assign(exports, {parseStatus, normalizeMessages, needsAck, priorityLabel, unreadCount, newestIdStr});")(Model);
+new Function("exports", `${source}\n;Object.assign(exports, {${names.join(", ")}});`)(Model);
 
 // A real pair of Pushover ids. Both are 19 digits; Number() rounds them, and
 // the rounded values are what a naive `a > b` would be comparing.
@@ -78,4 +82,29 @@ test("priority labels name only what is worth naming", () => {
   assert.equal(Model.priorityLabel(0), "");
   assert.equal(Model.priorityLabel(2), "Emergency");
   assert.equal(Model.priorityLabel(-1), "Quiet");
+});
+
+test("dismissed messages drop out of the list", () => {
+  const messages = [{ idStr: "c" }, { idStr: "b" }, { idStr: "a" }];
+  assert.deepEqual(Model.liveMessages(messages, ["b"]).map(m => m.idStr), ["c", "a"]);
+  assert.equal(Model.liveMessages(messages, []).length, 3);
+});
+
+test("dismissed messages are not counted as unread", () => {
+  const messages = [{ idStr: "c" }, { idStr: "b" }, { idStr: "a" }];
+  assert.equal(Model.unreadCount(messages, "a", []), 2);
+  assert.equal(Model.unreadCount(messages, "a", ["b"]), 1);
+  assert.equal(Model.unreadCount(messages, "a", ["b", "c"]), 0);
+});
+
+test("dismissing the marked message does not re-unread the ones above it", () => {
+  // The marker is held against the full list for exactly this reason.
+  const messages = [{ idStr: "c" }, { idStr: "b" }, { idStr: "a" }];
+  assert.equal(Model.unreadCount(messages, "b", ["b"]), 1);
+});
+
+test("the dismissed list is pruned to what the daemon still holds", () => {
+  const messages = [{ idStr: "b" }, { idStr: "a" }];
+  assert.deepEqual(Model.prunedDismissed(messages, ["a", "gone", "b"]), ["a", "b"]);
+  assert.deepEqual(Model.prunedDismissed(messages, null), []);
 });

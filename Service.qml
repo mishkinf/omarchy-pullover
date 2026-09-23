@@ -18,6 +18,8 @@ Item {
   property var messages: []
   property bool schemaUnsupported: false
   property string lastSeenIdStr: ""
+  property var dismissedIds: []
+  property var trial: ({})
   property string actionStatus: ""
 
   // Sign-in state. The daemon cannot report this -- it is not running until
@@ -41,9 +43,16 @@ Item {
   // The daemon never reads this file. Unread is a property of this screen
   // having been looked at, which only the widget can know.
   readonly property string lastSeenPath: stateHome + "/last-seen"
+  readonly property string dismissedPath: stateHome + "/dismissed"
 
-  readonly property int unread: Model.unreadCount(messages, lastSeenIdStr)
-  readonly property bool hasMessages: messages.length > 0
+  readonly property var liveMessages: Model.liveMessages(messages, dismissedIds)
+  readonly property int unread: Model.unreadCount(messages, lastSeenIdStr, dismissedIds)
+  readonly property bool hasMessages: liveMessages.length > 0
+
+  readonly property bool trialKnown: trial && trial.known === true && trial.licensed !== true
+  readonly property int trialDaysRemaining: trialKnown ? Number(trial.daysRemaining || 0) : -1
+  // Seven days is when it stops being trivia and starts being a deadline.
+  readonly property bool trialEndingSoon: trialKnown && trialDaysRemaining <= 7
 
   function refresh() {
     stateFile.reload()
@@ -84,6 +93,34 @@ Item {
     if (serviceProcess.running) return
     actionStatus = "Signing out…"
     serviceProcess.command = ["pushover-open-client", "logout"]
+    serviceProcess.running = true
+  }
+
+  function dismiss(idStr) {
+    if (!idStr || Model.isDismissed(idStr, dismissedIds)) return
+    var next = dismissedIds.slice()
+    next.push(String(idStr))
+    _writeDismissed(Model.prunedDismissed(messages, next))
+  }
+
+  function dismissAll() {
+    var next = []
+    for (var i = 0; i < messages.length; i++) next.push(messages[i].idStr)
+    _writeDismissed(next)
+  }
+
+  function _writeDismissed(list) {
+    dismissedIds = list
+    dismissedProcess.command = ["sh", "-c",
+      "mkdir -p \"$(dirname \"$1\")\" && printf '%s' \"$2\" > \"$1\"",
+      "sh", dismissedPath, list.join("\n")]
+    dismissedProcess.running = true
+  }
+
+  function markLicensed() {
+    if (serviceProcess.running) return
+    actionStatus = "Saved — the countdown stops."
+    serviceProcess.command = ["pushover-open-client", "licensed"]
     serviceProcess.running = true
   }
 
@@ -159,6 +196,20 @@ Item {
   }
 
   Process { id: markReadProcess }
+  Process { id: dismissedProcess }
+
+  FileView {
+    id: dismissedFile
+    path: root.dismissedPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      var body = String(text()).trim()
+      root.dismissedIds = body === "" ? [] : body.split("\n")
+    }
+    onLoadFailed: root.dismissedIds = []
+  }
   Process { id: openProcess }
 
   Process {
@@ -181,6 +232,7 @@ Item {
         root.loggedIn = data.loggedIn === true
         if (data.deviceName) root.deviceName = String(data.deviceName)
         if (data.suggestedDeviceName) root.suggestedDeviceName = String(data.suggestedDeviceName)
+        root.trial = data.trial || ({})
         root.serviceActive = data.service && data.service.active === true
         root.serviceEnabled = data.service && data.service.enabled === true
       } catch (error) {

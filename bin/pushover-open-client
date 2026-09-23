@@ -20,6 +20,7 @@ import asyncio
 import getpass
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -33,7 +34,7 @@ try:
 except ImportError:  # pragma: no cover - the setup script installs this
     sys.exit("pushover-open-client: python-requests is not installed (pacman -S python-requests)")
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 USER_AGENT = f"omarchy-pushover-open-client/{VERSION} (Linux)"
 
 API = "https://api.pushover.net/1"
@@ -52,6 +53,51 @@ RECONNECT_MIN = 5.0
 RECONNECT_MAX = 300.0
 HTTP_TIMEOUT = 30.0
 MESSAGE_HISTORY = 50
+
+# Pushover's own trial length. There is no API for licence or trial status --
+# no endpoint, no field, no websocket frame -- so this is counted from the
+# moment this device registered and is an ESTIMATE, not a reading.
+TRIAL_DAYS = 30
+TRIAL_WARN_AT_DAYS = (0, 1, 7)
+
+
+def trial_state() -> dict:
+    """Days left on the desktop trial, derived from the registration date.
+
+    Nothing warns a user when the trial ends -- the device simply stops
+    receiving -- so an estimate that is a few hours out is worth far more than
+    no estimate at all. `licensed` suppresses it entirely, because a user who
+    has paid must not be nagged and the API will not tell us that they have."""
+    if not CREDENTIALS_PATH.exists():
+        return {"known": False}
+
+    registered = None
+    licensed = False
+    try:
+        with CREDENTIALS_PATH.open() as handle:
+            creds = json.load(handle)
+        registered = creds.get("registered_at")
+        licensed = bool(creds.get("licensed"))
+    except (OSError, ValueError):
+        pass
+
+    if not registered:
+        # Logged in before this field existed. The credentials file is written
+        # once, at registration, so its mtime is that moment.
+        try:
+            registered = int(CREDENTIALS_PATH.stat().st_mtime)
+        except OSError:
+            return {"known": False}
+
+    elapsed_days = (time.time() - float(registered)) / 86400.0
+    remaining = TRIAL_DAYS - elapsed_days
+    return {
+        "known": True,
+        "licensed": licensed,
+        "registeredAt": int(registered),
+        "expiresAt": int(float(registered) + TRIAL_DAYS * 86400),
+        "daysRemaining": int(math.ceil(remaining)) if remaining > 0 else 0,
+    }
 
 
 def suggested_device_name() -> str:
@@ -86,6 +132,7 @@ def cache_dir() -> Path:
 
 CREDENTIALS_PATH = config_dir() / "credentials.json"
 STATUS_PATH = state_dir() / "status.json"
+TRIAL_WARNED_PATH = state_dir() / "trial-warned.json"
 
 
 def log(message: str) -> None:
@@ -202,7 +249,13 @@ def perform_login(email: str, password: str, twofa: str, device_name: str, force
     if not device_id:
         return {"ok": False, "error": "Device registration returned no id"}
 
-    save_credentials({"secret": secret, "device_id": device_id, "device_name": device_name})
+    save_credentials({
+        "secret": secret,
+        "device_id": device_id,
+        "device_name": device_name,
+        # The trial starts now, and nothing else will ever tell us when it did.
+        "registered_at": int(time.time()),
+    })
     return {"ok": True, "deviceName": device_name}
 
 
@@ -287,6 +340,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         "deviceName": device_name,
         "suggestedDeviceName": suggested_device_name(),
         "service": service_state(),
+        "trial": trial_state(),
         "version": VERSION,
     }))
     return 0
@@ -300,6 +354,21 @@ def cmd_service(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": False, "error": output or f"systemctl {verb} failed"}))
             return 1
     print(json.dumps({"ok": True, "service": service_state()}))
+    return 0
+
+
+def cmd_licensed(args: argparse.Namespace) -> int:
+    """Record that the desktop licence has been bought, so the trial countdown
+    stops. Pushover exposes no way to check this, so the user's word is the
+    only source there is."""
+    if not CREDENTIALS_PATH.exists():
+        print(json.dumps({"ok": False, "error": "Not signed in"}))
+        return 1
+    with CREDENTIALS_PATH.open() as handle:
+        creds = json.load(handle)
+    creds["licensed"] = not args.undo
+    save_credentials(creds)
+    print(json.dumps({"ok": True, "trial": trial_state()}))
     return 0
 
 
@@ -317,9 +386,24 @@ def cmd_logout(args: argparse.Namespace) -> int:
 
 
 def strip_html(text: str) -> str:
-    """Pushover's html=1 bodies carry a small tag subset. Notification daemons
-    disagree about markup, so the tags are dropped rather than translated."""
+    """Pushover's html=1 bodies carry a small tag subset."""
     return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def escape_markup(text: str) -> str:
+    """Omarchy renders a notification body as Qt StyledText, so a plain-text
+    body containing < or & is read as markup and mangled. Pushover bodies are
+    user-written and regularly contain both."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def body_for_notification(message: dict) -> str:
+    """Pushover's html=1 subset -- b, i, u, font color, a href -- is exactly
+    what Qt StyledText renders, and Omarchy strips only <img> before rendering.
+    So an HTML body is passed through and a plain one is escaped. Stripping the
+    tags instead, as this used to, threw away formatting the shell supports."""
+    raw = str(message.get("message") or "")
+    return raw if message.get("html") else escape_markup(raw)
 
 
 def icon_path(icon_name: str) -> str | None:
@@ -354,43 +438,71 @@ def urgency_for(priority: int) -> str:
     return "normal"
 
 
-def notify(message: dict) -> None:
-    if not shutil.which("notify-send"):
-        log("notify-send is not installed; cannot show the notification")
-        return
+def bypasses_dnd(priority: int) -> bool:
+    """Pushover priority 1 is defined as bypassing the user's quiet hours, and
+    2 is an emergency. Omarchy grants that only to the app names 'omarchy-action'
+    and 'notify-send' (NotificationLogic.js shouldBypassDnd), so a push sent
+    under its own app name is silenced by Do Not Disturb whatever its urgency."""
+    return priority >= 1
 
+
+def notification_argv(message: dict, icon: str | None, native: bool) -> list[str]:
     app = str(message.get("app") or "Pushover")
     title = str(message.get("title") or app)
-    body = str(message.get("message") or "")
-    if message.get("html"):
-        body = strip_html(body)
-
-    url = str(message.get("url") or "")
-    url_title = str(message.get("url_title") or "")
-    if url:
-        body = f"{body}\n{url_title or url}".strip()
-
+    body = body_for_notification(message)
     priority = int(message.get("priority") or 0)
-    args = [
-        "notify-send",
-        "--app-name", app,
-        "--urgency", urgency_for(priority),
-    ]
+    url = str(message.get("url") or "")
 
-    # Emergency pushes are the ones that must not be missed, so they are the
-    # ones that do not time out on their own.
+    if not native:
+        # Plain libnotify: no click action, and the app name always wins over
+        # the DND bypass because notify-send cannot set Omarchy's hints.
+        argv = ["notify-send", "--app-name", app, "--urgency", urgency_for(priority)]
+        if priority >= 2:
+            argv += ["--expire-time", "0"]
+        if icon:
+            argv += ["--icon", icon]
+        if url:
+            body = f"{body}\n{escape_markup(str(message.get('url_title') or url))}".strip()
+        return argv + ["--", title, body]
+
+    argv = ["omarchy-notification-send", "--urgency", urgency_for(priority)]
+
+    if bypasses_dnd(priority):
+        # Left as the default app name 'omarchy-action', which is what earns the
+        # bypass. The sender is named in the headline instead, so nothing is lost
+        # but the little grey app label.
+        if app.lower() not in title.lower():
+            title = f"{app}: {title}"
+    else:
+        argv += ["--app-name", app]
+
     if priority >= 2:
-        args += ["--expire-time", "0"]
+        argv += ["--expire-time", "0"]
+    if icon:
+        argv += ["--icon", icon]
+
+    argv += [title, body]
+
+    # A click opens the message's own URL. Omarchy carries this as data rather
+    # than a libnotify action, so it still works on a toast restored after a
+    # shell restart.
+    if url:
+        argv += ["--exec", "xdg-open", url]
+    return argv
+
+
+def notify(message: dict) -> None:
+    native = shutil.which("omarchy-notification-send") is not None
+    if not native and not shutil.which("notify-send"):
+        log("neither omarchy-notification-send nor notify-send is installed")
+        return
 
     icon = icon_path(str(message.get("icon") or "pushover"))
-    if icon:
-        args += ["--icon", icon]
-
-    args += ["--", title, body]
+    argv = notification_argv(message, icon, native)
     try:
-        subprocess.run(args, check=False, timeout=15)
+        subprocess.run(argv, check=False, timeout=15)
     except subprocess.TimeoutExpired:
-        log("notify-send timed out")
+        log("the notification command timed out")
 
 
 # --------------------------------------------------------------------------
@@ -478,9 +590,58 @@ class Client:
     def __init__(self, creds: dict) -> None:
         self.secret = creds["secret"]
         self.device_id = creds["device_id"]
+        self._trial_checked_at = 0.0
         self.status = Status()
         self.status.device_name = creds.get("device_name") or ""
         self.status.load()
+
+    def maybe_warn_about_trial(self) -> None:
+        """Warn before the trial ends rather than after.
+
+        An unlicensed device just stops receiving -- no notice, no error the
+        user sees -- so the one failure worth engineering against here is
+        finding out by missing something."""
+        now = time.monotonic()
+        if now - self._trial_checked_at < 3600:
+            return
+        self._trial_checked_at = now
+
+        trial = trial_state()
+        if not trial.get("known") or trial.get("licensed"):
+            return
+
+        try:
+            warned = set(json.loads(TRIAL_WARNED_PATH.read_text()))
+        except (OSError, ValueError):
+            warned = set()
+
+        remaining = int(trial.get("daysRemaining") or 0)
+        for threshold in sorted(TRIAL_WARN_AT_DAYS):
+            if remaining > threshold or threshold in warned:
+                continue
+            if threshold == 0:
+                title = "Pushover trial has ended"
+                body = ("This device may stop receiving. A one-time $4.99 desktop "
+                        "licence keeps it working: https://pushover.net/clients/desktop")
+            else:
+                title = f"Pushover trial ends in {remaining} day{'s' if remaining != 1 else ''}"
+                body = ("After that this device stops receiving. A one-time $4.99 "
+                        "licence: https://pushover.net/clients/desktop")
+            notify({
+                "title": title,
+                "message": body,
+                "app": "Pushover",
+                "priority": 1,
+                "url": "https://pushover.net/clients/desktop",
+                "url_title": "Buy the licence",
+            })
+            warned.add(threshold)
+            try:
+                TRIAL_WARNED_PATH.parent.mkdir(parents=True, exist_ok=True)
+                TRIAL_WARNED_PATH.write_text(json.dumps(sorted(warned)))
+            except OSError:
+                pass
+            break
 
     def sync_messages(self) -> None:
         """Download everything queued, show it, then tell the server it landed.
@@ -536,6 +697,7 @@ class Client:
                     # Anything that arrived while we were disconnected is
                     # waiting on the server, and the socket will not announce it.
                     self.sync_messages()
+                    self.maybe_warn_about_trial()
 
                     verdict = await self.listen(socket)
                     if verdict is not None:
@@ -564,6 +726,8 @@ class Client:
             code = frame[:1]
 
             if code == "#":
+                # The keepalive is the only regular tick this process gets.
+                self.maybe_warn_about_trial()
                 continue
             if code == "!":
                 self.sync_messages()
@@ -573,14 +737,22 @@ class Client:
                 return None
             if code == "E":
                 self.status.connected = False
-                self.status.last_error = "Pushover rejected this device. Run: pushover-open-client login --force"
+                # Pushover sends the same frame for a rejected device and for
+                # an unlicensed one past its trial, and exposes no way to tell
+                # them apart, so neither is asserted as the cause.
+                self.status.last_error = (
+                    "Pushover disconnected this device. Either the desktop licence "
+                    "has lapsed, or the device needs to sign in again."
+                )
                 self.status.write()
                 log(self.status.last_error)
                 notify({
                     "title": "Pushover disconnected",
-                    "message": "This device was rejected. Run: pushover-open-client login --force",
+                    "message": self.status.last_error,
                     "app": "Pushover",
                     "priority": 1,
+                    "url": "https://pushover.net/clients/desktop",
+                    "url_title": "Check your licence",
                 })
                 return EXIT_REAUTH
             if code == "A":
@@ -655,6 +827,10 @@ def main() -> int:
     service = sub.add_parser("service", help="enable, restart or stop the background client")
     service.add_argument("verb", choices=["enable", "restart", "stop"])
     service.set_defaults(func=cmd_service)
+
+    licensed = sub.add_parser("licensed", help="record that the desktop licence is bought; stops the countdown")
+    licensed.add_argument("--undo", action="store_true", help="unset it again")
+    licensed.set_defaults(func=cmd_licensed)
 
     logout = sub.add_parser("logout", help="stop the client and forget the credentials")
     logout.set_defaults(func=cmd_logout)
