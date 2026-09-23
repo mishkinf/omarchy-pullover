@@ -533,3 +533,22 @@ class HistorySurvivesARestart(unittest.TestCase):
         second = client.Status()
         second.load()
         self.assertEqual([m["title"] for m in second.messages], ["kept"])
+
+
+class IconCache(unittest.TestCase):
+    def test_the_cache_is_bounded_because_the_sender_names_the_icons(self):
+        cache = client.cache_dir()
+        cache.mkdir(parents=True, exist_ok=True)
+        for existing in cache.glob("*.png"):
+            existing.unlink()
+        for i in range(client.MAX_CACHED_ICONS + 25):
+            icon = cache / f"icon{i:04d}.png"
+            icon.write_bytes(b"x")
+            os.utime(icon, (i, i))          # oldest first
+
+        client.prune_icon_cache()
+        remaining = sorted(f.name for f in cache.glob("*.png"))
+        self.assertEqual(len(remaining), client.MAX_CACHED_ICONS)
+        # The oldest go, the newest stay.
+        self.assertNotIn("icon0000.png", remaining)
+        self.assertIn(f"icon{client.MAX_CACHED_ICONS + 24:04d}.png", remaining)

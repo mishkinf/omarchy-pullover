@@ -499,12 +499,27 @@ def icon_path(icon_name: str) -> str | None:
         tmp = target.with_suffix(".tmp")
         tmp.write_bytes(response.content)
         os.replace(tmp, target)
+        prune_icon_cache()
         return str(target)
     except (requests.RequestException, OSError):
         # OSError matters as much as a network failure here: a full disk or a
         # read-only cache used to raise straight out of notify(), out of
         # sync_messages, and be reported as "connection lost".
         return None
+
+
+def prune_icon_cache() -> None:
+    """Bound the cache. The icon name comes from the sender, so an unbounded
+    cache is a directory anyone who can push to this account can fill."""
+    try:
+        icons = sorted(cache_dir().glob("*.png"), key=lambda f: f.stat().st_mtime)
+    except OSError:
+        return
+    for stale in icons[:-MAX_CACHED_ICONS]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
 
 
 def urgency_for(priority: int) -> str:

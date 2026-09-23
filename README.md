@@ -196,7 +196,7 @@ somewhere a plugin can quietly behave badly:
 ./test
 ```
 
-78 tests — 60 Python, 18 Node — needing no network and no Pushover account.
+79 tests — 61 Python, 18 Node — needing no network and no Pushover account.
 They write only into a temp directory. The Node half is skipped if Node is not
 installed.
 
