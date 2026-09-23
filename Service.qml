@@ -22,9 +22,6 @@ Item {
   property var ackedIds: []
   property var trial: ({})
   property string actionStatus: ""
-  // Per-sender actions, from an optional config file. Empty is the norm: a
-  // plain Pushover install configures none and every row behaves as before.
-  property var handlers: []
 
   // Sign-in state. The daemon cannot report this -- it is not running until
   // there is a login -- so it is probed from the credentials file instead.
@@ -49,8 +46,6 @@ Item {
   readonly property string lastSeenPath: stateHome + "/last-seen"
   readonly property string dismissedPath: stateHome + "/dismissed"
   readonly property string ackedPath: stateHome + "/acked"
-  readonly property string handlersPath: (Quickshell.env("XDG_CONFIG_HOME")
-    || Quickshell.env("HOME") + "/.config") + "/pullover/handlers.json"
 
   readonly property var liveMessages: Model.liveMessages(messages, dismissedIds)
   readonly property int unread: Model.unreadCount(messages, lastSeenIdStr, dismissedIds)
@@ -181,22 +176,6 @@ Item {
     openProcess.running = true
   }
 
-  // The panel knows an id and a key; the daemon re-derives the handler from the
-  // message itself and refuses if it does not match. So this cannot talk it
-  // into running something the config does not authorise -- only the key
-  // crosses, never a command.
-  function runAction(idStr, key) {
-    if (!idStr || !key || actionProcess.running) return
-    var actions = Model.actionsFor(Model.messageById(messages, idStr), handlers)
-    var chosen = null
-    for (var i = 0; i < actions.length; i++) if (actions[i].key === key) chosen = actions[i]
-    if (!chosen) return
-    actionStatus = chosen.label + "\u2026"
-    statusClear.restart()
-    actionProcess.command = ["pullover", "action", String(key), "--id", String(idStr)]
-    actionProcess.running = true
-  }
-
   function applyState(raw) {
     var status = Model.parseStatus(raw)
     if (!status.ok) {
@@ -248,27 +227,6 @@ Item {
   Process {
     id: markReadProcess
     onExited: function (code) { if (code !== 0) root.writeFailed("the read marker") }
-  }
-
-  FileView {
-    id: handlersFile
-    path: root.handlersPath
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.handlers = Model.parseHandlers(text())
-    // No file at all is the ordinary case, not an error.
-    onLoadFailed: root.handlers = []
-  }
-
-  Process {
-    id: actionProcess
-    onExited: function (code) {
-      if (code !== 0) {
-        root.actionStatus = "That action could not be run."
-        statusClear.restart()
-      }
-    }
   }
 
   Process {
