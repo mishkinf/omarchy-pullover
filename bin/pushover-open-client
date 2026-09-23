@@ -33,7 +33,7 @@ try:
 except ImportError:  # pragma: no cover - the setup script installs this
     sys.exit("pushover-open-client: python-requests is not installed (pacman -S python-requests)")
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 USER_AGENT = f"omarchy-pushover-open-client/{VERSION} (Linux)"
 
 API = "https://api.pushover.net/1"
@@ -52,6 +52,21 @@ RECONNECT_MIN = 5.0
 RECONNECT_MAX = 300.0
 HTTP_TIMEOUT = 30.0
 MESSAGE_HISTORY = 50
+
+
+def suggested_device_name() -> str:
+    """Pushover device names are unique per account and constrained to 25 chars
+    of [A-Za-z0-9_-]. Two machines both defaulting to "omarchy" would collide on
+    the second one's registration, so the hostname is the better default."""
+    import socket
+
+    raw = ""
+    try:
+        raw = socket.gethostname().split(".")[0]
+    except OSError:
+        pass
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "-", raw).strip("-")[:25]
+    return cleaned or "omarchy"
 
 
 def config_dir() -> Path:
@@ -230,19 +245,20 @@ def cmd_login(args: argparse.Namespace) -> int:
             str(request.get("email") or "").strip(),
             str(request.get("password") or ""),
             str(request.get("twofa") or "").strip(),
-            str(request.get("deviceName") or args.device_name),
+            str(request.get("deviceName") or args.device_name or suggested_device_name()),
             bool(request.get("force") or args.force),
         )
         print(json.dumps(result))
         return 0 if result.get("ok") else 1
 
+    device_name = args.device_name or suggested_device_name()
     email = args.email or input("Pushover email: ").strip()
     password = getpass.getpass("Pushover password: ")
-    result = perform_login(email, password, "", args.device_name, args.force)
+    result = perform_login(email, password, "", device_name, args.force)
 
     if result.get("needsTwofa"):
         twofa = input("Two-factor code: ").strip()
-        result = perform_login(email, password, twofa, args.device_name, args.force)
+        result = perform_login(email, password, twofa, device_name, args.force)
 
     if not result.get("ok"):
         sys.exit(f"pushover-open-client: {result.get('error')}")
@@ -269,7 +285,9 @@ def cmd_probe(args: argparse.Namespace) -> int:
     print(json.dumps({
         "loggedIn": logged_in,
         "deviceName": device_name,
+        "suggestedDeviceName": suggested_device_name(),
         "service": service_state(),
+        "version": VERSION,
     }))
     return 0
 
@@ -386,10 +404,34 @@ class Status:
         self.device_name = ""
         self.messages: list[dict] = []
 
+    def load(self) -> None:
+        """Adopt the history already on disk.
+
+        Without this a restart -- a reboot, an update, a dropped socket that
+        outlived its backoff -- writes an empty message list on connect and the
+        panel forgets everything it was showing a second earlier."""
+        try:
+            data = json.loads(STATUS_PATH.read_text())
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+            return
+        kept = [m for m in data["messages"] if isinstance(m, dict)][:MESSAGE_HISTORY]
+        for message in kept:
+            # A file written before idStr existed. Python still holds the exact
+            # integer here; the widget would have to round it.
+            if not message.get("idStr"):
+                message["idStr"] = str(message.get("id") or "")
+        self.messages = kept
+
     def record(self, messages: list[dict]) -> None:
         for message in messages:
             self.messages.append({
                 "id": message.get("id"),
+                # Pushover ids are 19 digits, past JavaScript's safe-integer
+                # range, so the widget compares these strings and never the
+                # number -- JSON.parse would silently round the number.
+                "idStr": str(message.get("id_str") or message.get("id") or ""),
                 "title": str(message.get("title") or message.get("app") or "Pushover"),
                 "message": strip_html(str(message.get("message") or ""))
                 if message.get("html") else str(message.get("message") or ""),
@@ -438,6 +480,7 @@ class Client:
         self.device_id = creds["device_id"]
         self.status = Status()
         self.status.device_name = creds.get("device_name") or ""
+        self.status.load()
 
     def sync_messages(self) -> None:
         """Download everything queued, show it, then tell the server it landed.
@@ -599,7 +642,8 @@ def main() -> int:
 
     login = sub.add_parser("login", help="register this machine as a Pushover device")
     login.add_argument("--email", help="skip the email prompt")
-    login.add_argument("--device-name", default="omarchy", help="device name shown in Pushover (default: omarchy)")
+    login.add_argument("--device-name", default=None,
+                       help="device name shown in Pushover (default: this machine's hostname)")
     login.add_argument("--force", action="store_true", help="replace existing credentials")
     login.add_argument("--stdin", action="store_true",
                        help="read {email, password, twofa} as JSON on stdin and answer with JSON")

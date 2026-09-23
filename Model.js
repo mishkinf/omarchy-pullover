@@ -26,7 +26,9 @@ function parseStatus(raw) {
     return blank
   }
 
-  if (typeof data !== "object" || data === null) return blank
+  // An array is typeof "object" too, and a status file holding one is not a
+  // status file. Anything that is not a plain object reads as blank.
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return blank
 
   var version = Number(data.schemaVersion || 0)
   if (version > SCHEMA_VERSION) {
@@ -54,6 +56,7 @@ function normalizeMessages(list) {
     if (!m || typeof m !== "object") continue
     out.push({
       id: Number(m.id || 0),
+      idStr: String(m.idStr || m.id || ""),
       title: String(m.title || m.app || "Pushover"),
       message: String(m.message || ""),
       app: String(m.app || "Pushover"),
@@ -92,18 +95,20 @@ function relativeTime(epochSeconds, nowSeconds) {
   return new Date(epochSeconds * 1000).toLocaleDateString(Qt.locale(), "d MMM")
 }
 
-function unreadCount(messages, lastSeenId) {
-  var count = 0
+// Messages arrive newest-first, so "unread" is how many sit above the last one
+// that was read. This is deliberately a POSITION and an exact string match
+// rather than an id comparison: a Pushover id is 19 digits, JSON.parse turns it
+// into a double, and two ids that differ only in their final digits round to
+// the same value. Nothing here ever compares two ids as numbers.
+function unreadCount(messages, lastSeenIdStr) {
+  if (!lastSeenIdStr) return messages.length
   for (var i = 0; i < messages.length; i++) {
-    if (messages[i].id > lastSeenId) count++
+    if (messages[i].idStr === lastSeenIdStr) return i
   }
-  return count
+  // The marked message has aged out of the window, so everything held is new.
+  return messages.length
 }
 
-function highestId(messages) {
-  var highest = 0
-  for (var i = 0; i < messages.length; i++) {
-    if (messages[i].id > highest) highest = messages[i].id
-  }
-  return highest
+function newestIdStr(messages) {
+  return messages.length > 0 ? messages[0].idStr : ""
 }

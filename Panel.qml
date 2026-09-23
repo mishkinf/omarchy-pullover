@@ -61,7 +61,9 @@ Panel {
 
   function submitSignIn() {
     if (emailField.text === "" || passwordField.text === "") return
-    pushover.signIn(emailField.text, passwordField.text, twofaField.text, "omarchy")
+    // Empty means "use the hostname", which the client works out for itself.
+    pushover.signIn(emailField.text, passwordField.text, twofaField.text,
+                    deviceField.text !== "" ? deviceField.text : pushover.suggestedDeviceName)
   }
 
   function currentMessage() {
@@ -150,7 +152,8 @@ Panel {
       anchors.fill: parent
       // Documented contract of PanelKeyCatcher: a panel with an inline editor
       // must block it, or "j" scrolls the list instead of typing a letter.
-      blocked: emailField.activeFocus || passwordField.activeFocus || twofaField.activeFocus
+      blocked: emailField.activeFocus || passwordField.activeFocus
+        || twofaField.activeFocus || deviceField.activeFocus
       onMoveRequested: function (dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
@@ -235,11 +238,22 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          Text {
+            textFormat: Text.PlainText
+            visible: pushover.clientMissing
+            width: parent.width
+            text: "The client is not installed. Run ./setup in the plugin folder:\n~/.config/omarchy/plugins/io.github.mishkinf.pushover"
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
           // Signing in lives here rather than in a terminal: a plugin that
           // needs a CLI before it works has not handled authentication.
           Column {
             id: signInForm
-            visible: pushover.probed && !pushover.loggedIn
+            visible: pushover.probed && !pushover.loggedIn && !pushover.clientMissing
             width: parent.width
             spacing: Style.space(8)
 
@@ -273,6 +287,17 @@ Panel {
               width: parent.width
               placeholderText: "Password"
               password: true
+              foreground: root.foreground
+              enabled: !pushover.signingIn
+              onAccepted: root.submitSignIn()
+            }
+
+            TextField {
+              id: deviceField
+              width: parent.width
+              placeholderText: pushover.suggestedDeviceName !== ""
+                ? "Device name (" + pushover.suggestedDeviceName + ")"
+                : "Device name"
               foreground: root.foreground
               enabled: !pushover.signingIn
               onAccepted: root.submitSignIn()
@@ -325,7 +350,7 @@ Panel {
 
           // Signed in, but nothing is holding the socket.
           Column {
-            visible: pushover.loggedIn && !pushover.serviceActive && pushover.probed
+            visible: pushover.loggedIn && !pushover.serviceActive && pushover.probed && !pushover.clientMissing
             width: parent.width
             spacing: Style.space(8)
 
@@ -377,6 +402,21 @@ Panel {
             }
           }
 
+          PanelSeparator {
+            visible: pushover.loggedIn
+            foreground: root.foreground
+          }
+
+          Button {
+            visible: pushover.loggedIn
+            width: parent.width
+            foreground: root.dim
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            text: "Sign out " + (pushover.deviceName !== "" ? "(" + pushover.deviceName + ")" : "")
+            onClicked: pushover.signOut()
+          }
+
           Text {
             textFormat: Text.PlainText
             visible: !pushover.hasMessages && pushover.loggedIn && pushover.serviceActive
@@ -409,7 +449,8 @@ Panel {
 
     readonly property bool emergency: Model.needsAck(message)
     readonly property string priorityText: Model.priorityLabel(message.priority || 0)
-    readonly property bool unread: (message.id || 0) > pushover.lastSeenId
+    // Position, not id: see the note on unreadCount in Model.js.
+    readonly property bool unread: rowIndex < pushover.unread
 
     hasCursor: root.cursorActive && root.cursorIndex === rowIndex
     foreground: root.foreground

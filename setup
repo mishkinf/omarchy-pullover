@@ -1,40 +1,44 @@
 #!/bin/bash
-# omarchy plugin add only clones files, so this is the rest of the install.
+# `omarchy plugin add` only clones files. This is the rest of the install:
+# the client, its systemd unit, and the packages both need.
+#
+# Safe to re-run -- that is how the plugin is updated.
 
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")" && pwd)
 
-omarchy pkg add python-websockets python-requests libnotify
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy pkg add python-websockets python-requests libnotify
+else
+  echo "omarchy not found; install python-websockets, python-requests and libnotify yourself." >&2
+fi
 
 install -Dm755 "$root/bin/pushover-open-client" "$HOME/.local/bin/pushover-open-client"
 install -Dm644 "$root/systemd/pushover-open-client.service" \
   "$HOME/.config/systemd/user/pushover-open-client.service"
 systemctl --user daemon-reload
 
-credentials="${XDG_CONFIG_HOME:-$HOME/.config}/pushover/credentials.json"
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) echo "note: $HOME/.local/bin is not on your PATH; the CLI will not be found in a shell." >&2 ;;
+esac
 
-if [[ -f $credentials ]]; then
-  # restart, not enable --now: an already-running daemon would otherwise stay
-  # on the old script after an update.
+if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/pushover/credentials.json" ]]; then
+  # restart rather than `enable --now`: an already-running daemon would
+  # otherwise keep serving the old script after an update.
   systemctl --user enable pushover-open-client.service
   systemctl --user restart pushover-open-client.service
-  echo "Pushover client restarted."
+  echo "Pushover client restarted on the new version."
 else
   cat <<'MSG'
 
-Installed. One step left — register this machine with Pushover:
+Installed.
 
-  pushover-open-client login
+  omarchy plugin enable io.github.mishkinf.pushover --section right
 
-Then start it:
-
-  systemctl --user enable --now pushover-open-client.service
-
-Pushover for Desktop is free for 30 days, then a one-time $4.99 licence on your
-account: https://pushover.net/clients/desktop
+Then click the bell in the bar and sign in there. Pushover for Desktop is free
+for 30 days, then a one-time $4.99 licence on your account:
+https://pushover.net/clients/desktop
 MSG
 fi
-
-echo
-echo "Add the bar widget:  omarchy bar add io.github.mishkinf.pushover --section right"

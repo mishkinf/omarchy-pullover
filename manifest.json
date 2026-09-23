@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.mishkinf.pushover",
   "name": "Pushover",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Mishkin Faustini",
   "license": "MIT",
   "description": "Pushover pushes as native desktop notifications, plus a bar widget with unread count and recent-message history. Uses Pushover's Open Client API, so every push that reaches the phone reaches this machine.",
@@ -31,10 +31,13 @@
       },
       {
         "key": "maxVisible",
-        "type": "number",
+        "type": "integer",
         "label": "Messages shown in the panel",
         "description": "The client keeps the last 50; this is how many the panel lists.",
-        "defaultValue": 12
+        "defaultValue": 12,
+        "min": 1,
+        "max": 50,
+        "step": 1
       }
     ]
   }

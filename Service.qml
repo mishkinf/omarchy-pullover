@@ -17,7 +17,7 @@ Item {
   property string deviceName: ""
   property var messages: []
   property bool schemaUnsupported: false
-  property int lastSeenId: 0
+  property string lastSeenIdStr: ""
   property string actionStatus: ""
 
   // Sign-in state. The daemon cannot report this -- it is not running until
@@ -29,6 +29,11 @@ Item {
   property bool signingIn: false
   property bool needsTwofa: false
   property string loginError: ""
+  property string suggestedDeviceName: ""
+  // The plugin can be enabled without ./setup having been run, in which case
+  // the CLI is not on PATH. That is a different problem from being signed out
+  // and needs a different answer.
+  property bool clientMissing: false
 
   readonly property string stateHome: (Quickshell.env("XDG_STATE_HOME")
     || Quickshell.env("HOME") + "/.local/state") + "/pushover"
@@ -37,12 +42,14 @@ Item {
   // having been looked at, which only the widget can know.
   readonly property string lastSeenPath: stateHome + "/last-seen"
 
-  readonly property int unread: Model.unreadCount(messages, lastSeenId)
+  readonly property int unread: Model.unreadCount(messages, lastSeenIdStr)
   readonly property bool hasMessages: messages.length > 0
 
   function refresh() {
     stateFile.reload()
-    lastSeenFile.reload()
+    // The read marker is deliberately NOT reloaded here. It is watched, and a
+    // reload racing markAllRead's write returns the pre-write content and
+    // silently un-reads everything the user just looked at.
     probe()
   }
 
@@ -81,12 +88,12 @@ Item {
   }
 
   function markAllRead() {
-    var highest = Model.highestId(messages)
-    if (highest <= lastSeenId) return
-    lastSeenId = highest
+    var newest = Model.newestIdStr(messages)
+    if (newest === "" || newest === lastSeenIdStr) return
+    lastSeenIdStr = newest
     markReadProcess.command = ["sh", "-c",
       "mkdir -p \"$(dirname \"$1\")\" && printf '%s' \"$2\" > \"$1\"",
-      "sh", lastSeenPath, String(highest)]
+      "sh", lastSeenPath, newest]
     markReadProcess.running = true
   }
 
@@ -146,12 +153,9 @@ Item {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onLoaded: {
-      var parsed = parseInt(String(text()).trim(), 10)
-      root.lastSeenId = isNaN(parsed) ? 0 : parsed
-    }
+    onLoaded: root.lastSeenIdStr = String(text()).trim()
     // No marker yet means nothing has been read, which is the correct start.
-    onLoadFailed: root.lastSeenId = 0
+    onLoadFailed: root.lastSeenIdStr = ""
   }
 
   Process { id: markReadProcess }
@@ -163,11 +167,20 @@ Item {
     stdout: StdioCollector { id: probeOut; waitForEnd: true }
     onExited: function (exitCode) {
       root.probed = true
+      var raw = String(probeOut.text || "")
+      if (exitCode !== 0 && raw.trim() === "") {
+        // Nothing on stdout and a non-zero exit is what a missing command
+        // looks like; a probe that ran would have answered in JSON.
+        root.clientMissing = true
+        return
+      }
+      root.clientMissing = false
       if (exitCode !== 0) return
       try {
-        var data = JSON.parse(String(probeOut.text || "{}"))
+        var data = JSON.parse(raw || "{}")
         root.loggedIn = data.loggedIn === true
         if (data.deviceName) root.deviceName = String(data.deviceName)
+        if (data.suggestedDeviceName) root.suggestedDeviceName = String(data.suggestedDeviceName)
         root.serviceActive = data.service && data.service.active === true
         root.serviceEnabled = data.service && data.service.enabled === true
       } catch (error) {

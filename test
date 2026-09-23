@@ -1,0 +1,16 @@
+#!/bin/bash
+# Unit tests. No network, no real filesystem, no Pushover account.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+echo "== client (python) =="
+python3 -m unittest discover -s tests -p 'test_*.py'
+
+if command -v node >/dev/null 2>&1; then
+  echo
+  echo "== widget model (node) =="
+  node --test tests/
+else
+  echo
+  echo "== widget model: skipped, node not installed =="
+fi

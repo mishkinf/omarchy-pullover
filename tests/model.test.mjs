@@ -1,0 +1,81 @@
+// Tests for Model.js, the widget's pure interpretation of status.json.
+// Model.js is QML-flavoured JavaScript, so the `.pragma library` line is
+// stripped before it is evaluated here.
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import test from "node:test";
+import assert from "node:assert/strict";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const source = readFileSync(join(here, "..", "Model.js"), "utf8")
+  .replace(/^\.pragma library\s*$/m, "");
+const Model = {};
+new Function("exports", source + "\n;Object.assign(exports, {parseStatus, normalizeMessages, needsAck, priorityLabel, unreadCount, newestIdStr});")(Model);
+
+// A real pair of Pushover ids. Both are 19 digits; Number() rounds them, and
+// the rounded values are what a naive `a > b` would be comparing.
+const IDS = ["1182737485987742200", "1182737485987742201"];
+
+test("two ids that differ only in the last digit are not equal as numbers", () => {
+  assert.equal(Number(IDS[0]), Number(IDS[1]),
+    "precondition: these ids collide once parsed as doubles");
+  assert.notEqual(IDS[0], IDS[1]);
+});
+
+test("unread counts position, so colliding ids stay distinct", () => {
+  const messages = [{ idStr: IDS[1] }, { idStr: IDS[0] }];
+  assert.equal(Model.unreadCount(messages, IDS[0]), 1);
+  assert.equal(Model.unreadCount(messages, IDS[1]), 0);
+});
+
+test("no marker means everything is unread", () => {
+  assert.equal(Model.unreadCount([{ idStr: "a" }, { idStr: "b" }], ""), 2);
+});
+
+test("a marker that aged out of the window means everything is unread", () => {
+  assert.equal(Model.unreadCount([{ idStr: "a" }], "long-gone"), 1);
+});
+
+test("newestIdStr takes the head, because the daemon writes newest-first", () => {
+  assert.equal(Model.newestIdStr([{ idStr: "new" }, { idStr: "old" }]), "new");
+  assert.equal(Model.newestIdStr([]), "");
+});
+
+test("a status file from a newer daemon is refused, not guessed at", () => {
+  const status = Model.parseStatus(JSON.stringify({ schemaVersion: 99 }));
+  assert.equal(status.ok, false);
+  assert.equal(status.schemaTooNew, true);
+});
+
+test("unparseable input reads as blank rather than throwing", () => {
+  for (const input of ["", "   ", "not json", "null", "[]"]) {
+    const status = Model.parseStatus(input);
+    assert.equal(status.ok, false, `input: ${JSON.stringify(input)}`);
+    assert.deepEqual(status.messages, []);
+  }
+});
+
+test("normalizeMessages keeps the id as a string and drops junk entries", () => {
+  const out = Model.normalizeMessages([
+    { id: 1182737485987742200, idStr: IDS[0], title: "t" },
+    null,
+    "nonsense",
+  ]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].idStr, IDS[0]);
+});
+
+test("only an unacknowledged emergency with a receipt offers the action", () => {
+  assert.equal(Model.needsAck({ priority: 2, receipt: "r", acked: false }), true);
+  assert.equal(Model.needsAck({ priority: 2, receipt: "r", acked: true }), false);
+  assert.equal(Model.needsAck({ priority: 2, receipt: "", acked: false }), false);
+  assert.equal(Model.needsAck({ priority: 1, receipt: "r", acked: false }), false);
+});
+
+test("priority labels name only what is worth naming", () => {
+  assert.equal(Model.priorityLabel(0), "");
+  assert.equal(Model.priorityLabel(2), "Emergency");
+  assert.equal(Model.priorityLabel(-1), "Quiet");
+});
